@@ -1,20 +1,26 @@
-name: Build Linux Release
+name: Build DilV Linux Release
 
 on:
   workflow_dispatch:  # Manual trigger
   push:
     tags:
-      - 'v*'  # Trigger on version tags
+      - 'v*'  # Trigger on version tags (same tags as DIL releases)
 
 jobs:
-  build-linux:
+  build-dilv-linux:
     runs-on: ubuntu-22.04  # Pin to match seed-node Ubuntu version (glibc parity)
 
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-      with:
-        submodules: recursive  # Pulls depends/randomx, depends/chiavdf, depends/dilithium
+
+    - name: Checkout submodules
+      run: |
+        git submodule update --init depends/chiavdf
+        git submodule update --init depends/dilithium
+        # RandomX not needed for dilv-node consensus (DilV uses VDF) but
+        # init it so the shared Makefile's randomx link step doesn't error.
+        git submodule update --init depends/randomx || true
 
     - name: Install dependencies
       run: |
@@ -29,7 +35,7 @@ jobs:
           libminiupnpc-dev \
           libgmp-dev
 
-    - name: Build RandomX
+    - name: Build RandomX (for shared Makefile compatibility)
       run: |
         cd depends/randomx
         mkdir -p build
@@ -61,11 +67,11 @@ jobs:
         make clean || true
         make -j$(nproc)
 
-    - name: Build Dilithion (all targets)
+    - name: Build dilv-node + check-wallet-balance
       run: |
         make clean
-        make -j$(nproc)
-        ls -lh dilithion-node dilv-node check-wallet-balance genesis_gen
+        make dilv-node check-wallet-balance -j$(nproc)
+        ls -lh dilv-node check-wallet-balance
 
     - name: Extract version from tag
       id: get_version
@@ -73,18 +79,18 @@ jobs:
         if [[ $GITHUB_REF == refs/tags/* ]]; then
           VERSION=${GITHUB_REF#refs/tags/}
         else
-          VERSION="dev"
+          VERSION="v1.0.0"
         fi
         echo "version=$VERSION" >> $GITHUB_OUTPUT
         echo "Detected version: $VERSION"
 
-    - name: Create DIL release package
+    - name: Create DilV release package
       env:
         VERSION: ${{ steps.get_version.outputs.version }}
       run: |
-        chmod +x package-linux-release.sh
-        ./package-linux-release.sh
-        ls -lh "releases/dilithion-${VERSION}-mainnet-linux-x64.tar.gz"
+        chmod +x package-dilv-linux-release.sh
+        ./package-dilv-linux-release.sh
+        ls -lh "releases/dilv-${VERSION}-mainnet-linux-x64.tar.gz"
 
     - name: Verify bundled libraries
       env:
@@ -92,12 +98,12 @@ jobs:
       run: |
         # Confirm every dynamic dep is either bundled in lib/ or is a system
         # library expected on every reasonable Linux distro.
-        EXTRACT_DIR="releases/dilithion-${VERSION}-mainnet-linux-x64"
+        EXTRACT_DIR="releases/dilv-${VERSION}-mainnet-linux-x64"
         echo "Bundled libraries:"
         ls -lh "${EXTRACT_DIR}/lib/" || { echo "ERROR: lib/ directory missing"; exit 1; }
         echo ""
-        echo "ldd output for dilithion-node (note: build host paths; users use bundled libs via run-node.sh):"
-        ldd "${EXTRACT_DIR}/dilithion-node"
+        echo "ldd output for dilv-node (note: build host paths; users use bundled libs via run-node.sh):"
+        ldd "${EXTRACT_DIR}/dilv-node"
         echo ""
         # Sanity-check critical libs are present in the bundle.
         for required in libleveldb.so.1d libssl.so.3 libcrypto.so.3 libminiupnpc.so.17 libgmp.so.10 libsnappy.so.1; do
@@ -111,13 +117,13 @@ jobs:
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
-        name: dilithion-${{ steps.get_version.outputs.version }}-mainnet-linux-x64
-        path: releases/dilithion-${{ steps.get_version.outputs.version }}-mainnet-linux-x64.tar.gz
+        name: dilv-${{ steps.get_version.outputs.version }}-mainnet-linux-x64
+        path: releases/dilv-${{ steps.get_version.outputs.version }}-mainnet-linux-x64.tar.gz
 
     - name: Upload to release (if tag)
       if: startsWith(github.ref, 'refs/tags/')
       uses: softprops/action-gh-release@v1
       with:
-        files: releases/dilithion-${{ steps.get_version.outputs.version }}-mainnet-linux-x64.tar.gz
+        files: releases/dilv-${{ steps.get_version.outputs.version }}-mainnet-linux-x64.tar.gz
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
