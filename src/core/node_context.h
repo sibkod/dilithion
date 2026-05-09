@@ -37,14 +37,20 @@ class CCooldownTracker;  // VDF cooldown rate limiter
 class CPeerMIKTracker;   // Sybil defense: block relay source tracking
 
 // Phase 5: chain selector (frozen interface from Phase 0).
-namespace dilithion::consensus {
-    class IChainSelector;
-}
-
 // Phase 6 PR6.5a: ISyncCoordinator adapter (Bitcoin Core PeerManager port).
-namespace dilithion::net::port {
-    class ISyncCoordinator;
-}
+//
+// Full includes required because unique_ptr needs the complete type for default_delete.
+// (Pre-existing forward declarations of IChainSelector and ISyncCoordinator broke
+// test_dilithion builds — gcc 11+ instantiates ~unique_ptr<T> at struct-definition time
+// even when the class destructor is defined out-of-line via the Pimpl pattern.
+// The out-of-line ~NodeContext() in node_context.cpp keeps working for production
+// binaries because that TU sees complete types; test TUs do not. Switching to full
+// includes mirrors the digital_dna pattern below. Discovered during cut → main
+// integration merge 2026-05-09; was latent on cut because cut's ci.yml workflow
+// — which is the only one that runs `make test_dilithion` — had never run on
+// the cut branch.)
+#include <consensus/ichain_selector.h>
+#include <net/port/sync_coordinator.h>
 
 // Digital DNA: Sybil-resistant identity system
 // Full include required because unique_ptr needs the complete type for default_delete
