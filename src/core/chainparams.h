@@ -11,7 +11,8 @@ namespace Dilithion {
 enum Network {
     MAINNET,
     TESTNET,
-    DILV        // DilV: VDF distribution payment chain
+    DILV,       // DilV: VDF distribution payment chain
+    REGTEST     // Phase 5: regression-test mode for byte-equivalence integration tests
 };
 
 /**
@@ -138,6 +139,59 @@ public:
     // After this height: verified MIKs get 12, unverified get 3 free blocks
     int dfmpV34ActivationHeight;
 
+    // Phase 3 port: minimum chain-work threshold for HeadersSync PRESYNC
+    // gating. A peer's claimed header chain must accumulate at least this
+    // much work in PRESYNC before transitioning to REDOWNLOAD. Mainnet:
+    // recent-checkpoint chain-work value. Testnet/regtest: zero (no gate).
+    // Pre-Phase-3 the gate was hardcoded to zero in CHeadersManager;
+    // chainparams now owns the value per chain.
+    uint256 nMinimumChainWork;
+
+    // Phase 4 port: outbound connection class targets. Bitcoin Core's
+    // ThreadOpenConnections maintains separate counts for each class.
+    //   nOutboundFullRelayTarget — exchanges blocks + tx + addrs (default 8)
+    //   nOutboundBlockRelayTarget — anti-eclipse, blocks only (per Phase 0
+    //                                §10 Q4: 4 for DilV's 45s blocks where
+    //                                propagation latency matters more, 2 for
+    //                                DIL's 240s where propagation absorbs)
+    int nOutboundFullRelayTarget;
+    int nOutboundBlockRelayTarget;
+
+    // Phase 6 PR6.1 (v1.5 §3.2 + Cursor CONCERN 1 fix): per-chain cap on
+    // chain_selector's mapBlockIndex (pre-validation block index entries).
+    // Without this cap, an attacker that floods rejected-parent descendant
+    // headers can grow mapBlockIndex monotonically. Cap is enforced in
+    // chain_selector_impl::ProcessNewHeader; eviction is by lowest-work-
+    // not-on-best-chain (mirrors setChainTips eviction discipline).
+    //
+    // Values sized to ~one week of attacker headers at maximum sustained
+    // rate. DIL (240s blocks): 500K = ~14 weeks at 1 header/sec attack.
+    // DilV (60s blocks): 5M ≈ same window scaled to faster blocks.
+    // Regtest: 1000 (small enough to test cap-saturation in unit tests).
+    // Default-init to 0 = "no cap" — chain_selector treats cap<=0 as
+    // disabled (per `if (cap > 0 && ...)` guard in ProcessNewHeader).
+    // Subagent v1.5+ MINOR fix: prevent UB if ChainParams ever
+    // default-constructed without going through a factory.
+    int nMapBlockIndexCap{0};
+
+    // Phase 6 PR6.1 (v1.5 §4 PR6.1 + Cursor v1.5+ per-spec fix B1):
+    // per-peer header rate limit. Prior implementation hardcoded these
+    // constants in headers_manager.h. SSOT discipline + per-chain
+    // tunability says they belong here. Defaults match the prior
+    // hardcoded values (1000 headers / 60s window) so behavior is
+    // unchanged across DIL/Testnet/DilV/Regtest unless a factory
+    // overrides.
+    int nHeaderRateWindowSec{60};
+    // v4.1: bumped 1000 -> 5000. The rate limit is per-peer per-window. Standard
+    // MAX_HEADERS_RESULTS = 2000 per batch (Bitcoin Core idiom), so 1000/60s
+    // would silently reject every legitimate headers batch in QueueHeadersForValidation
+    // (line 2495, no verbose log). Discovered during SYD mainnet IBD test 2026-05-02
+    // where SYD couldn't sync from any v4.0.x peer because every 2000-header batch
+    // hit the limit. 5000 allows 2.5 standard batches per 60s = ~83 headers/sec
+    // sustained, well above legitimate IBD throughput, while still rejecting a peer
+    // that floods more than 5x normal pace.
+    int nHeaderRateLimitPerWindow{5000};
+
     // VDF Fair Mining parameters
     // vdfActivationHeight: Hybrid period starts (accept both RandomX and VDF blocks)
     // vdfExclusiveHeight:  VDF-only period (reject RandomX blocks after this)
@@ -218,6 +272,47 @@ public:
     // = ~360s for cooldown=8) let one miner win 3 consecutive blocks because
     // each block was just over the threshold. 999999999 = never retired.
     int timeBasedCooldownExpiryRetiredHeight;
+
+    // v4.2.0 — Time-decay cooldown activation height (HARD FORK).
+    // After this height, the legacy block-only cooldown + V2 stall exemption
+    // tier system at chain.cpp is REPLACED by a single self-correcting rule:
+    //
+    //   miner is in cooldown if blocks_since_last_win < max(0,
+    //       cooldown_blocks - max(0, time_since_last_win) / cooldownTimeDecaySeconds)
+    //
+    // Equivalent: every miner currently in cooldown has their effective
+    // cooldown reduced by 1 block for every cooldownTimeDecaySeconds of
+    // wall-clock that passes. Naturally rate-limits attackers (1 block per
+    // ~43 min for single-miner concentration) while recovering automatically
+    // from low-hashpower stalls.
+    //
+    // Replaces brittle stall-exemption-tier system (chain.cpp:1339-1500 v4.1).
+    // Does NOT replace CheckConsecutiveMiner or CheckMIKWindowCap — those run
+    // independently and remain active.
+    //
+    // 999999999 = disabled (legacy cooldown path active; default for any chain
+    //             not yet activated)
+    int timeDecayCooldownActivationHeight{999999999};
+
+    // v4.2.0 — Decay rate for time-decay cooldown.
+    // 60 = mainnet default (1 block of cooldown drains per 60 seconds wall-clock).
+    // Smaller = faster recovery but more attack-permissive for slow chains.
+    // Larger = slower recovery but more conservative attack rate cap.
+    // See c:\tmp\v4_2_cooldown_sensitivity.py for the sensitivity table.
+    int cooldownTimeDecaySeconds{60};
+
+    // v4.1 deterministic snapshot: number of distinct MIK identities that
+    // had mined at least one block by height 44232 on the canonical pre-fork
+    // chain. Embedded for the v4.1 mandatory rollback so every v4.1 node
+    // can verify (in startup_checkpoint_validator) that its populator-
+    // computed lifetime miner count matches the canonical value at the
+    // activation height — closes the non-determinism risk where pre-44233
+    // history could be ingested differently across nodes.
+    //
+    // 0 = disabled (placeholder used during the pass-1 build that captures
+    // the count from a v4.0.x chain; must be > 0 in any tagged release).
+    int lifetimeMinerCountAt44232 = 0;
+
 
     // VDF cooldown short window (blocks) for dual-window cooldown.
     // After stabilizationForkHeight, effective cooldown = min(longCooldown, shortCooldown).
@@ -404,6 +499,7 @@ public:
     static ChainParams Mainnet();
     static ChainParams Testnet();
     static ChainParams DilV();
+    static ChainParams Regtest();  // Phase 5: regression-test mode
 
     // Helper methods
     const char* GetNetworkName() const {
@@ -411,6 +507,7 @@ public:
             case MAINNET: return "mainnet";
             case TESTNET: return "testnet";
             case DILV:    return "dilv";
+            case REGTEST: return "regtest";
             default:      return "unknown";
         }
     }
@@ -418,6 +515,7 @@ public:
     bool IsMainnet() const { return network == MAINNET; }
     bool IsTestnet() const { return network == TESTNET; }
     bool IsDilV() const { return network == DILV; }
+    bool IsRegtest() const { return network == REGTEST; }
 
     /**
      * MAINNET SECURITY: Get the last checkpoint at or before given height

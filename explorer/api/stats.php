@@ -20,7 +20,7 @@ $cacheDir = _explorerCacheDir();
 $cacheFile = "{$cacheDir}/stats{$chainSuffix}.json";
 if (file_exists($cacheFile)) {
     $cacheAge = time() - filemtime($cacheFile);
-    if ($cacheAge < 30) {
+    if ($cacheAge < 5) {
         $cached = file_get_contents($cacheFile);
         if ($cached !== false) {
             $data = json_decode($cached, true);
@@ -92,7 +92,7 @@ $holderCacheFile = "{$cacheDir}/holders{$chainSuffix}.json";
 $holderCacheValid = false;
 if (file_exists($holderCacheFile)) {
     $holderCacheAge = time() - filemtime($holderCacheFile);
-    if ($holderCacheAge < 60) {
+    if ($holderCacheAge < 30) {
         $holderCached = file_get_contents($holderCacheFile);
         if ($holderCached !== false) {
             $holderData = json_decode($holderCached, true);
@@ -139,6 +139,7 @@ $result = [
     "activeMiners" => $activeMiners,          // distinct MIKs in last active window
     "activeMinersWindow" => $config['chain'] === 'dilv' ? ACTIVE_WINDOW_DILV : ACTIVE_WINDOW_DIL,
     "nodesOnline" => $nodesOnlineInfo['nodesOnline'] ?? null,
+    "uniquePeers" => $nodesOnlineInfo['uniquePeers'] ?? ($nodesOnlineInfo['nodesOnline'] ?? null),
     "seedsResponding" => $nodesOnlineInfo['seedsResponding'] ?? null,
     "totalTransactions" => $totalTxs,
     "nextHalving" => $nextHalving,

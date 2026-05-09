@@ -44,6 +44,9 @@ void CRPCPermissions::InitializeMethodPermissions() {
     // explicitly admit testmempoolaccept here so unknown-method fallback never
     // applies.
     m_methodPermissions["testmempoolaccept"]  = readBlockchain;
+    // Phase 9 PR9.3: --usenewpeerman burn-in telemetry (read-only).
+    m_methodPermissions["getsyncstatus"]      = readBlockchain;
+    m_methodPermissions["getblockdownloadstats"] = readBlockchain;
 
     // ========================================================================
     // Wallet Read Methods (READ_WALLET = 0x0002)

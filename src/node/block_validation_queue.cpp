@@ -7,7 +7,7 @@
 #include <consensus/pow.h>
 #include <consensus/validation.h>  // For CheckCoinbase
 #include <node/blockchain_storage.h>
-#include <node/ibd_coordinator.h>  // A1 FIX: For OnBlockConnected()
+#include <net/port/sync_coordinator.h>  // Phase 6 PR6.5a: OnBlockConnected via adapter
 #include <net/net.h>               // A5: For SendRejectMessage()
 #include <core/node_context.h>
 #include <core/chainparams.h>
@@ -353,7 +353,8 @@ bool CBlockValidationQueue::ProcessBlock(const QueuedBlock& queued_block) {
         // Create block index
         auto pblockIndex = std::make_unique<CBlockIndex>(block);
         pblockIndex->phashBlock = blockHash;
-        pblockIndex->nStatus = CBlockIndex::BLOCK_HAVE_DATA;
+        // v4.3.3 F14: canonical block-receipt flag-setter (F1 + F7 combined).
+        pblockIndex->MarkBlockReceived();
 
         // Link to parent
         pblockIndex->pprev = m_chainstate.GetBlockIndex(block.hashPrevBlock);
@@ -408,8 +409,8 @@ bool CBlockValidationQueue::ProcessBlock(const QueuedBlock& queued_block) {
 
     // A1 FIX: Notify IBD coordinator that a block connected successfully
     // Resets orphan streak counter (Layer 2 fork detection) and updates block-flow timestamp
-    if (g_node_context.ibd_coordinator) {
-        g_node_context.ibd_coordinator->OnBlockConnected();
+    if (g_node_context.sync_coordinator) {
+        g_node_context.sync_coordinator->OnBlockConnected();
     }
 
     // DEAD CODE REMOVED: OnChunkBlockReceived and OnWindowBlockConnected
@@ -459,7 +460,9 @@ bool CBlockValidationQueue::ProcessBlock(const QueuedBlock& queued_block) {
                     // Create block index for orphan
                     auto pOrphanIndex = std::make_unique<CBlockIndex>(orphanBlock);
                     pOrphanIndex->phashBlock = orphanBlockHash;
-                    pOrphanIndex->nStatus = CBlockIndex::BLOCK_HAVE_DATA;
+                    // v4.3.3 F14: canonical block-receipt flag-setter
+                    // (F1 + F7 combined) at the orphan-resolve path.
+                    pOrphanIndex->MarkBlockReceived();
                     pOrphanIndex->pprev = pOrphanParent;
                     pOrphanIndex->nHeight = orphanHeight;
                     pOrphanIndex->BuildChainWork();
@@ -470,11 +473,30 @@ bool CBlockValidationQueue::ProcessBlock(const QueuedBlock& queued_block) {
                         continue;
                     }
 
-                    // Add to chain state (may fail if another thread beat us - that's OK)
-                    CBlockIndex* pOrphanIndexRaw = pOrphanIndex.get();
+                    // Add to chain state. With Phase 11 ABI flag-merge semantics
+                    // (chain.cpp AddBlockIndex), this returns true on merge into
+                    // an existing entry — the moved-from unique_ptr is destroyed
+                    // and any raw pointer to its payload is dangling. We must
+                    // re-resolve via GetBlockIndex to get the canonical map-owned
+                    // CBlockIndex* before any further use. (Cursor v4.3 close-readiness
+                    // review of ABI surfaced this orphan-path UAF.)
                     if (!m_chainstate.AddBlockIndex(orphanBlockHash, std::move(pOrphanIndex))) {
-                        // Another thread already added this orphan - just erase from pool
+                        // (Practically unreachable now that ABI returns true on merge.
+                        // Kept defensively in case AddBlockIndex shape changes again.)
                         g_node_context.orphan_manager->EraseOrphanBlock(orphanHash);
+                        continue;
+                    }
+
+                    // Re-resolve the raw pointer post-AddBlockIndex. Whether the
+                    // moved unique_ptr was adopted (fresh insertion) or destroyed
+                    // (merge into existing entry), the chainstate map now owns
+                    // the canonical CBlockIndex* for this hash.
+                    CBlockIndex* pOrphanIndexRaw = m_chainstate.GetBlockIndex(orphanBlockHash);
+                    if (!pOrphanIndexRaw) {
+                        // Should be impossible after AddBlockIndex returned true.
+                        // Surface loudly rather than UAF on a dangling get().
+                        std::cerr << "[ValidationQueue] FATAL: AddBlockIndex returned true but GetBlockIndex returned null for "
+                                  << orphanBlockHash.GetHex().substr(0, 16) << "..." << std::endl;
                         continue;
                     }
 

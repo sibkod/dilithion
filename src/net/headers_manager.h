@@ -5,8 +5,10 @@
 #define DILITHION_NET_HEADERS_MANAGER_H
 
 #include <primitives/block.h>
+#include <node/block_index.h>     // CBlockIndex (was via chain_tips_tracker.h)
 #include <net/headerssync.h>
-#include <net/chain_tips_tracker.h>
+// PR5.2.B (2026-04-26): chain_tips_tracker.h retired — setChainTips
+// (std::set<uint256> below) alone serves as the canonical leaf set.
 #include <chrono>
 #include <condition_variable>
 #include <map>
@@ -295,6 +297,26 @@ public:
     int GetBestHeight() const;
 
     /**
+     * @brief Atomic sync-state snapshot — single cs_headers acquisition.
+     *
+     * Phase 10 PR10.2: eliminates the multi-lock-acquisition tip-skew race
+     * documented at Phase 9 PR9.6-RT-MEDIUM-2 (a). Calling
+     * GetSyncProgress() / GetBestHeight() / GetBestHeaderHash() in
+     * sequence acquires cs_headers three times; a header arriving
+     * between calls can shift the tip, leaving height + hash referring
+     * to different blocks. This getter reads all three under ONE lock,
+     * guaranteeing internal consistency of the returned snapshot.
+     *
+     * @return SyncSnapshot { progress, best_height, best_hash }
+     */
+    struct SyncSnapshot {
+        double progress;       ///< 0.0–1.0; 0.0 if no peers
+        int best_height;       ///< Best validated header chain tip height
+        uint256 best_hash;     ///< Best validated header chain tip hash
+    };
+    SyncSnapshot GetSyncSnapshot() const;
+
+    /**
      * @brief Get best header hash (from chain tips tracker)
      *
      * @return Hash of best validated header tip
@@ -525,12 +547,31 @@ public:
      */
     std::string GetForkDebugInfo() const;
 
-    /**
-     * @brief Get the chain tips tracker for advanced fork analysis
-     *
-     * @return Reference to chain tips tracker
-     */
-    const CChainTipsTracker& GetChainTipsTracker() const { return m_chainTipsTracker; }
+    // PR5.2.B (2026-04-26): GetChainTipsTracker() retired. Callers wanting
+    // tip enumeration should use HasCompetingForks() / GetForkCount() /
+    // GetForkDebugInfo() which now derive from setChainTips directly.
+    //
+    // Two compatibility helpers for external callers (ibd_coordinator)
+    // that previously walked ChainTipsTracker:
+    //   GetBestHeaderChainWork() — max chain_work across known tips
+    //   GetCompetingHeaderTips() — vector of (hash, height, chainWork) tuples
+    // These walk setChainTips + mapHeaders. Phase 6 HeadersManager rewrite
+    // retires both as ibd_coordinator stops needing them.
+
+    /// Per-tip info exposed to external callers (formerly ChainTip from
+    /// chain_tips_tracker.h).
+    struct HeaderTipInfo {
+        uint256 hash;
+        int height;
+        uint256 chainWork;
+    };
+
+    /// Returns the maximum chain_work observed across known tips, or
+    /// uint256() if no tips are known.
+    uint256 GetBestHeaderChainWork() const;
+
+    /// Returns all known tips (one entry per setChainTips member).
+    std::vector<HeaderTipInfo> GetCompetingHeaderTips() const;
 
     /**
      * @brief Build a map of storage hashes for a fork's ancestry
@@ -725,15 +766,51 @@ private:
     // Bug #46 Fix: Track multiple chain tips for competing chains
     std::set<uint256> setChainTips;         ///< All known chain tips (leaves in tree)
 
+    // Phase 6 PR6.2: Per-tip last-seen timestamp for TTL aging.
+    // Keyed by tip hash; value = unix-seconds when this tip was most recently
+    // re-announced via UpdateChainTips(). Used by TTL-eviction to drop
+    // stale tips that haven't been re-seen, regardless of chainWork.
+    // Per-chain TTL: see ChainParams::ChainTipTTLSeconds().
+    std::map<uint256, int64_t> m_chainTipsLastSeen;
+
+    // Phase 6 PR6.1 (v1.5 §4 PR6.1): per-peer header rate limit.
+    // Sliding window tracking pre-validation headers received per peer.
+    // Caps an attacker from filling chain_selector's mapBlockIndex
+    // (capped at 500K for DIL / 5M for DilV) faster than a sustainable
+    // rate.
+    //
+    // Window + limit live in chainparams (Cursor v1.5+ per-spec fix B1):
+    //   * ChainParams.nHeaderRateWindowSec       (default 60)
+    //   * ChainParams.nHeaderRateLimitPerWindow  (default 1000)
+    // SSOT: per-chain tunable, no longer hardcoded here.
+    struct PeerHeaderRate {
+        int64_t window_start_unix_sec = 0;
+        int     headers_in_window      = 0;
+    };
+    std::map<NodeId, PeerHeaderRate> m_peerHeaderRate;
+
+    // Returns true if peer is within rate limit (header batch may proceed).
+    // Returns false if peer has exceeded the rate limit; caller MUST drop
+    // the batch and SHOULD report misbehavior via IPeerScorer.
+    // Caller already holds cs_headers.
+    bool CheckPeerHeaderRateLimit(NodeId peer, size_t batchSize);
+
     // Bug #46 Fix: Minimum chain work for DoS protection
     uint256 nMinimumChainWork;              ///< Reject chains below this work threshold
+
+    // Phase 3: chain-agnostic proof checker. Owned here; non-owning
+    // pointer passed to each HeadersSyncState. Picked at construction time
+    // based on g_chainParams (RandomXHeaderProofChecker for DIL,
+    // VDFHeaderProofChecker for DilV).
+    std::unique_ptr<::dilithion::net::IHeaderProofChecker> m_proof_checker;
 
     // Bug #150 Fix: Best chain cache for fork-safe height lookups
     mutable std::map<int, uint256> m_bestChainCache;  ///< Height -> Hash on best chain
     mutable bool m_bestChainCacheDirty{true};          ///< Cache needs rebuild
 
-    // Bug #150 Fix: Chain tips tracker for fork management
-    CChainTipsTracker m_chainTipsTracker;              ///< Tracks competing chain tips
+    // PR5.2.B (2026-04-26): m_chainTipsTracker member retired. setChainTips
+    // (declared above as std::set<uint256>) is the canonical leaf set;
+    // chainWork lookups go through mapHeaders[tipHash].chainWork.
 
     // Peer synchronization state
     std::map<NodeId, PeerSyncState> mapPeerStates;        ///< Peer -> Basic sync state

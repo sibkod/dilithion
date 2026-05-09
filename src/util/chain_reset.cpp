@@ -3,6 +3,9 @@
 
 #include <util/chain_reset.h>
 
+#include <consensus/chain.h>  // v4.3.2 M1: CChainState flag accessors
+#include <uint256.h>          // v4.3.2 M1: GetLastUndoFailureHash() return type
+
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
@@ -126,6 +129,164 @@ bool WriteAutoRebuildMarker(const std::string& datadir, const std::string& reaso
     }
     std::cerr << "[Recovery] Wrote auto_rebuild marker to " << markerPath.string()
               << " (reason: " << reason << ")" << std::endl;
+    return true;
+}
+
+// =============================================================================
+// v4.3.2 M1 fix — process-lifetime once-latch for MaybeTriggerChainRebuild.
+//
+// The legacy implementation in CIbdCoordinator::Tick() used a function-static
+// `bool recovery_triggered = false`. The free-function version preserves the
+// semantics with a translation-unit-static atomic; ResetMaybeTriggerLatchForTesting
+// resets it for unit tests that drive multiple scenarios in one process.
+//
+// Atomic chosen over plain bool so that, if a future refactor calls the helper
+// from multiple threads, the compare_exchange_strong ensures exactly-once
+// semantics under any interleaving.
+// =============================================================================
+namespace {
+std::atomic<bool> g_chain_rebuild_latch_consumed{false};
+}  // namespace
+
+void ResetMaybeTriggerLatchForTesting() {
+    g_chain_rebuild_latch_consumed.store(false, std::memory_order_release);
+}
+
+bool MaybeTriggerChainRebuild(CChainState& chainstate,
+                              const std::string& datadir,
+                              std::atomic<bool>* running_flag) {
+    // 1) Cheap path: poll both flags. Atomic loads, no lock.
+    const bool utxo_rebuild = chainstate.NeedsUTXORebuild();
+    const bool chain_rebuild = chainstate.NeedsChainRebuild();
+    if (!utxo_rebuild && !chain_rebuild) {
+        return false;
+    }
+
+    // 2) Latch: ensure exactly-once activation per process. compare_exchange_strong
+    // returns true ONLY for the thread that flipped false→true; everyone else
+    // observes already-consumed and bails. Production main loop is
+    // single-threaded so the atomicity is defensive, not load-bearing.
+    bool expected = false;
+    if (!g_chain_rebuild_latch_consumed.compare_exchange_strong(
+            expected, true,
+            std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return false;
+    }
+
+    // 3) Determine the cause class. v4.3.3 F11 (Layer-3 round 2 MEDIUM-1):
+    // chain_rebuild flag can fire from either UndoBlock-family failures
+    // (BUG #277, v4.0.19, v4.3.1 BLOCKER #1 sites) or from F8's reorg-
+    // depth rejection. Read the cause via the chainstate accessor; the
+    // FlagChainRebuild helper guarantees release-store of the reason
+    // BEFORE the flag, so this acquire-load sees a consistent pair.
+    const CChainState::ChainRebuildReason chain_cause =
+        chain_rebuild ? chainstate.GetChainRebuildReason()
+                      : CChainState::ChainRebuildReason::UndoFailure;
+
+    // 4) Print the CRITICAL banner. UTXO-rebuild text unchanged. Chain-
+    // rebuild text branches on cause so operators get accurate diagnostics
+    // (pre-F11 the M1 helper always said "Persistent UndoBlock failure"
+    // for any chain-rebuild fire — operationally misleading, log scrapers
+    // misdiagnose). F11 added DepthRejection; F16 (Layer-3 round 3 INFO-1)
+    // added ConnectTipFailure / DisconnectTipFailure / ReadBlockFailure /
+    // WriteBestBlockFailure cause classes for the previously-mislabeled
+    // BLOCKER #1 sites. Each gets a banner that names the actual cause.
+    std::cerr << "\n==========================================================" << std::endl;
+    if (utxo_rebuild) {
+        std::cerr << "CRITICAL: UTXO corruption detected! Auto-recovery initiated." << std::endl;
+    } else {
+        switch (chain_cause) {
+            case CChainState::ChainRebuildReason::DepthRejection:
+                std::cerr << "CRITICAL: Reorg depth exceeded MAX_REORG_DEPTH — "
+                          << "bootstrap too stale for in-process catch-up. "
+                          << "Auto-recovery initiated." << std::endl;
+                break;
+            case CChainState::ChainRebuildReason::ConnectTipFailure:
+                std::cerr << "CRITICAL: ConnectTip failure mid-reorg — chain "
+                          << "truncated. Auto-recovery initiated." << std::endl;
+                break;
+            case CChainState::ChainRebuildReason::DisconnectTipFailure:
+                std::cerr << "CRITICAL: DisconnectTip failure mid-reorg — chain "
+                          << "partially rewound. Auto-recovery initiated." << std::endl;
+                break;
+            case CChainState::ChainRebuildReason::ReadBlockFailure:
+                std::cerr << "CRITICAL: ReadBlock failure after disconnects "
+                          << "committed — chain truncated. Auto-recovery initiated." << std::endl;
+                break;
+            case CChainState::ChainRebuildReason::WriteBestBlockFailure:
+                std::cerr << "CRITICAL: WriteBestBlock failure mid-reorg — "
+                          << "DB/in-memory tip divergence. Auto-recovery initiated." << std::endl;
+                break;
+            case CChainState::ChainRebuildReason::UndoFailure:
+            default:
+                std::cerr << "CRITICAL: Persistent UndoBlock failure detected! Auto-recovery initiated." << std::endl;
+                break;
+        }
+    }
+    std::cerr << "The node will shut down and rebuild on next restart." << std::endl;
+    std::cerr << "==========================================================" << std::endl;
+
+    // 5) Build the marker reason string. UTXO branches preserved; chain-
+    // rebuild branches on cause to give the operator a useful root-cause
+    // string in <datadir>/auto_rebuild for runbook diagnosis.
+    std::string reason;
+    const std::string heightStr = std::to_string(chainstate.GetHeight());
+    if (utxo_rebuild && chain_rebuild) {
+        uint256 failing = chainstate.GetLastUndoFailureHash();
+        reason = "UTXO corruption AND persistent UndoBlock failure at height "
+                 + heightStr + " hash=" + failing.GetHex();
+    } else if (utxo_rebuild) {
+        reason = "UTXO corruption detected at height " + heightStr;
+    } else {
+        switch (chain_cause) {
+            case CChainState::ChainRebuildReason::DepthRejection:
+                reason = "Reorg depth exceeded MAX_REORG_DEPTH at height " + heightStr
+                         + "; bootstrap too stale for in-process catch-up; wipe-and-IBD required";
+                break;
+            case CChainState::ChainRebuildReason::ConnectTipFailure:
+                reason = "ConnectTip failure mid-reorg at height " + heightStr
+                         + "; chain truncated; wipe-and-IBD required";
+                break;
+            case CChainState::ChainRebuildReason::DisconnectTipFailure:
+                reason = "DisconnectTip failure mid-reorg at height " + heightStr
+                         + "; chain partially rewound; wipe-and-IBD required";
+                break;
+            case CChainState::ChainRebuildReason::ReadBlockFailure:
+                reason = "ReadBlock failure after disconnects committed at height " + heightStr
+                         + "; chain truncated; wipe-and-IBD required";
+                break;
+            case CChainState::ChainRebuildReason::WriteBestBlockFailure:
+                reason = "WriteBestBlock failure mid-reorg at height " + heightStr
+                         + "; DB/in-memory tip divergence; wipe-and-IBD required";
+                break;
+            case CChainState::ChainRebuildReason::UndoFailure:
+            default: {
+                uint256 failing = chainstate.GetLastUndoFailureHash();
+                reason = "Persistent UndoBlock failure at height "
+                         + heightStr + " hash=" + failing.GetHex();
+                break;
+            }
+        }
+    }
+
+    // 5) Write the marker. On failure WriteAutoRebuildMarker logs to stderr
+    // itself; we still log a node-level ERROR so log scrapers picking up
+    // [Recovery] lines also see [CRITICAL] context. Disk failure must NOT
+    // suppress shutdown — running on broken chain state is strictly worse
+    // than crash-looping with an obvious error.
+    const bool wrote = WriteAutoRebuildMarker(datadir, reason);
+    if (!wrote) {
+        std::cerr << "[CRITICAL] MaybeTriggerChainRebuild: marker write failed "
+                  << "(datadir='" << datadir << "'). Forcing shutdown anyway — "
+                  << "operator must wipe datadir manually before restart."
+                  << std::endl;
+    }
+
+    // 6) Signal node shutdown. Tests pass nullptr to skip this step.
+    if (running_flag != nullptr) {
+        running_flag->store(false, std::memory_order_release);
+    }
+
     return true;
 }
 

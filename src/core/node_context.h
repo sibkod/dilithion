@@ -36,6 +36,22 @@ class CVDFMiner;         // VDF fair mining controller
 class CCooldownTracker;  // VDF cooldown rate limiter
 class CPeerMIKTracker;   // Sybil defense: block relay source tracking
 
+// Phase 5: chain selector (frozen interface from Phase 0).
+// Phase 6 PR6.5a: ISyncCoordinator adapter (Bitcoin Core PeerManager port).
+//
+// Full includes required because unique_ptr needs the complete type for default_delete.
+// (Pre-existing forward declarations of IChainSelector and ISyncCoordinator broke
+// test_dilithion builds — gcc 11+ instantiates ~unique_ptr<T> at struct-definition time
+// even when the class destructor is defined out-of-line via the Pimpl pattern.
+// The out-of-line ~NodeContext() in node_context.cpp keeps working for production
+// binaries because that TU sees complete types; test TUs do not. Switching to full
+// includes mirrors the digital_dna pattern below. Discovered during cut → main
+// integration merge 2026-05-09; was latent on cut because cut's ci.yml workflow
+// — which is the only one that runs `make test_dilithion` — had never run on
+// the cut branch.)
+#include <consensus/ichain_selector.h>
+#include <net/port/sync_coordinator.h>
+
 // Digital DNA: Sybil-resistant identity system
 // Full include required because unique_ptr needs the complete type for default_delete
 #include <digital_dna/dna_registry_db.h>
@@ -58,6 +74,11 @@ struct NodeContext {
     // Core blockchain state
     CChainState* chainstate{nullptr};
 
+    // Phase 5: chain selector adapter (block-index-tree based selection).
+    // Owned here; ChainSelectorAdapter holds a non-owning CChainState&
+    // reference, so this MUST be reset before chainstate is freed.
+    std::unique_ptr<dilithion::consensus::IChainSelector> chain_selector;
+
     // P2P networking
     std::unique_ptr<CPeerManager> peer_manager;
     std::unique_ptr<CConnman> connman;  // Phase 2: Event-driven connection manager
@@ -70,6 +91,15 @@ struct NodeContext {
     std::unique_ptr<CBlockValidationQueue> validation_queue;  // Phase 2: Async block validation
     std::unique_ptr<CBlockTracker> block_tracker;  // IBD Redesign: Single source of truth for block state
     CIbdCoordinator* ibd_coordinator{nullptr};  // Phase 5.1: IBD state machine (raw ptr, owned by main)
+
+    // Phase 6 PR6.5a: ISyncCoordinator adapter — stable surface used by
+    // ~37 production touch sites that previously called ibd_coordinator
+    // directly. Always backed by CIbdCoordinatorAdapter (wrapping legacy
+    // CIbdCoordinator) post v4.3.4 Option C cut: the alternate
+    // port::CPeerManager backing was retired (Block 7) along with the
+    // --usenewpeerman flag (Block 8). Lifetime: owned by main()
+    // alongside ibd_coordinator.
+    std::unique_ptr<dilithion::net::port::ISyncCoordinator> sync_coordinator;
 
     // Transaction relay
     CAsyncBroadcaster* async_broadcaster{nullptr};
@@ -144,8 +174,28 @@ struct NodeContext {
     bool Init(const std::string& datadir, CChainState* chainstate_ptr);
 
     /**
+     * Phase 11 A1: enable fork-staging dispatch on the chain selector adapter.
+     *
+     * Called by node startup AFTER blockchain_db has been wired (after
+     * NodeContext::Init returns). Replaces the Phase-5 chain_selector with
+     * a fork-staging-enabled adapter that routes fork blocks through
+     * ForkManager::PreValidateBlock + TriggerChainSwitch instead of calling
+     * ActivateBestChain directly.
+     *
+     * Idempotent. Safe to call before blockchain_db is wired (returns false,
+     * leaves the Phase-5 adapter in place). Production callers (dilithion-node.cpp,
+     * dilv-node.cpp) MUST call this once blockchain_db is set, or fork-staging
+     * stays disabled on the port path and the 2026-04-25-class incident
+     * mitigation is lost.
+     *
+     * @return true if fork-staging dispatch was wired; false if prerequisites
+     *         (chainstate / blockchain_db) are not yet ready.
+     */
+    bool WireForkStaging();
+
+    /**
      * Shutdown node context
-     * 
+     *
      * Gracefully shuts down all components and releases resources.
      * Safe to call multiple times.
      */

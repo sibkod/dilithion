@@ -8,14 +8,20 @@
 #include <core/chainparams.h>
 #include <node/block_index.h>
 #include <node/mempool.h>
-#include <node/ibd_coordinator.h>
+#include <net/port/sync_coordinator.h>  // Phase 6 PR6.5a: routes via ISyncCoordinator
+#include <net/headers_manager.h>        // F19: CHeadersManager::OnPeerDisconnected
 #include <net/net.h>
 #include <net/connman.h>
 #include <net/protocol.h>
+#include <net/port/addrman_v2.h>             // Phase 1 port: CAddrMan_v2 (default)
+#include <net/port/legacy_addrman_adapter.h> // Phase 1 port: legacy fallback
+#include <net/port/peer_scorer.h>             // Phase 2 port: CPeerScorer
 #include <digital_dna/digital_dna.h>  // Digital DNA: Sybil-resistant identity
 #include <util/strencodings.h>
 #include <util/logging.h>
 #include <algorithm>
+#include <cstdlib>  // std::getenv (Phase 1 port: addrman impl selection)
+#include <cstring>  // std::strcmp
 #include <set>
 
 // SSOT: Access to global node context for CBlockTracker
@@ -26,10 +32,11 @@ extern NodeContext g_node_context;
 
 // CPeer implementation
 
-bool CPeer::Misbehaving(int howmuch) {
-    misbehavior_score += howmuch;
-    return misbehavior_score >= CPeerManager::BAN_THRESHOLD;
-}
+// Phase 2 port: CPeer::Misbehaving DELETED (Q3=B). Scoring lives in
+// CPeerScorer; the cumulative-score-and-cross-threshold logic moved to
+// CPeerScorer::Misbehaving. Callers that previously did
+// `peer->Misbehaving(score)` now go through `CPeerManager::Misbehaving(
+// peer_id, score, type)` which forwards to the scorer.
 
 void CPeer::Ban(int64_t ban_until) {
     state = STATE_BANNED;
@@ -43,9 +50,13 @@ void CPeer::Disconnect() {
 }
 
 std::string CPeer::ToString() const {
-    return strprintf("CPeer(id=%d, addr=%s, state=%d, version=%d, height=%d, score=%d)",
+    // Phase 2 port: misbehavior_score field deleted; this string is used
+    // only for debug logging where the score is a nice-to-have, not load-
+    // bearing. Callers wanting the score should query
+    // CPeerManager::GetMisbehaviorScore(peer_id) directly.
+    return strprintf("CPeer(id=%d, addr=%s, state=%d, version=%d, height=%d)",
                     id, addr.ToString().c_str(), state, version,
-                    start_height, misbehavior_score);
+                    start_height);
 }
 
 // CPeerManager implementation
@@ -54,15 +65,81 @@ CPeerManager::CPeerManager(const std::string& datadir)
     : banman(datadir), next_peer_id(1), data_dir(datadir) {
     InitializeSeedNodes();
 
-    // Load persisted peer addresses from peers.dat
+    // Phase 1 port: select address-manager implementation.
+    //
+    // Default: CAddrMan_v2 (new port). Operator escape hatch:
+    //   DILITHION_USE_ADDRMAN_V2=0  -> wrap legacy CAddrMan via the adapter.
+    //
+    // The adapter exposes the same IAddressManager surface, so the rest of
+    // CPeerManager can call addrman-> uniformly regardless of impl. CLI-flag
+    // wiring is deliberately deferred to Phase 6 (PeerManager rewrite); env
+    // var keeps the rollback path operator-accessible without that plumbing.
+    {
+        const char* env = std::getenv("DILITHION_USE_ADDRMAN_V2");
+        const bool use_legacy = (env != nullptr) && (std::strcmp(env, "0") == 0);
+        if (use_legacy) {
+            addrman = std::make_unique<dilithion::net::port::LegacyAddrManAdapter>();
+        } else {
+            addrman = std::make_unique<dilithion::net::port::CAddrMan_v2>();
+        }
+    }
+
+    // Configure persistence path before any Load/Save call. Either impl
+    // silently ignores Save/Load when the path is empty (headless tests).
     if (!data_dir.empty()) {
+        addrman->SetDataPath(data_dir + "/peers.dat");
         LoadPeers();
     }
-    
-    // Network: Initialize enhanced peer discovery
-    peer_discovery = std::make_unique<CPeerDiscovery>(*this, addrman);
-    
+
+    // Phase 2 port: select misbehavior scorer.
+    //
+    // Default: CPeerScorer (the new port). Operator escape hatch:
+    //   DILITHION_USE_NEW_PEER_SCORER=0  -> m_scorer stays null; Misbehaving
+    //                                       and DecayMisbehaviorScores become
+    //                                       tracking-disabled no-ops. Manual
+    //                                       ban via RPC still works; protocol-
+    //                                       level disconnects still fire.
+    //
+    // Same env-var pattern as Phase 1's DILITHION_USE_ADDRMAN_V2. CLI-flag
+    // wiring deferred to Phase 6 per plan §10 Q4 / consistency rule.
+    {
+        const char* env = std::getenv("DILITHION_USE_NEW_PEER_SCORER");
+        const bool disabled = (env != nullptr) && (std::strcmp(env, "0") == 0);
+        if (!disabled) {
+            m_scorer = std::make_unique<dilithion::net::port::CPeerScorer>();
+        }
+    }
+
+    // Network: Initialize enhanced peer discovery against the interface.
+    peer_discovery = std::make_unique<CPeerDiscovery>(*this, *addrman);
+
     // Network: Connection quality tracker is initialized automatically (default constructor)
+}
+
+// Phase 2 port: cumulative misbehavior score for a peer. Replaces direct
+// reads of the deleted CPeer::misbehavior_score field. Returns 0 if the
+// scorer is null (env-var=OFF tracking-disabled mode) or if the peer has
+// no recorded score.
+int CPeerManager::GetMisbehaviorScore(int peer_id) const {
+    if (!m_scorer) return 0;
+    return m_scorer->GetScore(peer_id);
+}
+
+// Phase 3: typed-reason Misbehaving for HeadersSync-layer call sites.
+// Routes through the maybe_punish_node.h wrapper to compute the weight
+// (DefaultWeight + Q6=B override), maps to the legacy diagnostic enum
+// for banlist.dat audit, then calls the existing Misbehaving forwarder
+// so seed-node guard + banman.Ban + AddrMan signal all fire.
+void CPeerManager::MisbehaveHeaders(
+    int peer_id,
+    ::dilithion::net::port::HeaderRejectReason reason)
+{
+    const int weight = ::dilithion::net::port::HeaderRejectWeight(reason);
+    const auto policy_type =
+        ::dilithion::net::port::MapHeaderRejectToMisbehaviorType(reason);
+    const ::MisbehaviorType diag =
+        ::dilithion::net::port::MapPolicyToDiagnostic(policy_type);
+    Misbehaving(peer_id, weight, diag);
 }
 
 bool CPeerManager::SavePeers() {
@@ -71,10 +148,14 @@ bool CPeerManager::SavePeers() {
     }
 
     std::string path = data_dir + "/peers.dat";
-    bool result = addrman.SaveToFile(path);
+    // SetDataPath was already configured in the constructor; this just
+    // re-affirms in case the data_dir changed mid-life (unusual). Safe to
+    // call repeatedly.
+    addrman->SetDataPath(path);
+    bool result = addrman->Save();
 
     if (result) {
-        LogPrintf(NET, INFO, "Saved %zu peer addresses to %s", addrman.Size(), path.c_str());
+        LogPrintf(NET, INFO, "Saved %zu peer addresses to %s", addrman->Size(), path.c_str());
     } else {
         LogPrintf(NET, ERROR, "Failed to save peers to %s", path.c_str());
     }
@@ -88,10 +169,11 @@ bool CPeerManager::LoadPeers() {
     }
 
     std::string path = data_dir + "/peers.dat";
-    bool result = addrman.LoadFromFile(path);
+    addrman->SetDataPath(path);
+    bool result = addrman->Load();
 
     if (result) {
-        LogPrintf(NET, INFO, "Loaded %zu peer addresses from %s", addrman.Size(), path.c_str());
+        LogPrintf(NET, INFO, "Loaded %zu peer addresses from %s", addrman->Size(), path.c_str());
     }
     // Silent if no existing peers.dat - normal for new node
 
@@ -191,6 +273,9 @@ void CPeerManager::RemovePeer(int peer_id) {
         it->second->Disconnect();
         peers.erase(it);
     }
+    // Phase 2 port: reclaim the scorer's map slot for this NodeId. The
+    // map would otherwise grow unbounded over node uptime (slow-leak DoS).
+    if (m_scorer) m_scorer->ResetScore(peer_id);
 }
 
 std::shared_ptr<CPeer> CPeerManager::GetPeer(int peer_id) {
@@ -218,6 +303,44 @@ std::vector<std::shared_ptr<CPeer>> CPeerManager::GetConnectedPeers() {
         }
     }
     // P5-LOW FIX: Return without std::move to allow RVO (copy elision)
+    return result;
+}
+
+std::vector<CPeerManager::BlockDownloadEntry> CPeerManager::GetBlockDownloadSnapshot() const {
+    // Phase 10 PR10.2 — joint atomic snapshot under cs_peers.
+    //
+    // Lock-ordering: cs_peers → block_tracker.m_mutex (established order
+    // at the two genuinely-nested precedents MarkBlockAsInFlight + Get-
+    // BlocksInFlightForPeer; see header docblock for audit details). No
+    // deadlock potential — block_tracker's encapsulation invariant
+    // (block_tracker.h:419) prevents the inverse order from existing.
+    //
+    // Performance profile (PR10.2-RT-MEDIUM-1 honest characterization):
+    // holds cs_peers for O(N) where N is connected-peer count (capped at
+    // 125 by MAX_OUTBOUND_CONNECTIONS + max_inbound). Each iteration
+    // nested-locks block_tracker.m_mutex for an O(1) map lookup. Worst-
+    // case hold time at N=125 is ~20-50µs (per-iteration map lookup is
+    // a few hundred ns + recursive_mutex acquisition overhead). This is
+    // operationally fine for a telemetry-tier RPC consumed every ~10min
+    // during burn-in (PR9.2 runbook §3 cadence) — but would NOT be
+    // appropriate inside a hot peer-event path that holds cs_peers
+    // under load (e.g. peer-event dispatch, MarkBlockAsInFlight per
+    // block request).
+    std::lock_guard<std::recursive_mutex> lock(cs_peers);
+
+    std::vector<BlockDownloadEntry> result;
+    if (!g_node_context.block_tracker) {
+        return result;  // empty — block_tracker not initialized
+    }
+
+    for (const auto& pair : peers) {
+        if (pair.second->IsConnected()) {
+            BlockDownloadEntry entry;
+            entry.peer_id = pair.first;
+            entry.blocks_in_flight = g_node_context.block_tracker->GetPeerInFlightCount(pair.first);
+            result.push_back(entry);
+        }
+    }
     return result;
 }
 
@@ -285,33 +408,22 @@ void CPeerManager::AddPeerAddress(const NetProtocol::CAddress& addr) {
         return;
     }
 
-    // Convert NetProtocol::CAddress to CService for CAddrMan
-    // Create CNetAddr from IP bytes
-    CNetAddr netaddr;
-
-    // Check if IPv4-mapped address (::ffff:x.x.x.x)
-    // IPv4-mapped prefix: 00 00 00 00 00 00 00 00 00 00 FF FF
-    static const uint8_t ipv4_mapped_prefix[12] = {0,0,0,0,0,0,0,0,0,0,0xff,0xff};
-    bool is_ipv4 = (memcmp(addr.ip, ipv4_mapped_prefix, 12) == 0);
-
-    if (is_ipv4) {
-        // IPv4 address - extract from last 4 bytes
-        uint32_t ipv4 = ((uint32_t)addr.ip[12] << 24) |
-                        ((uint32_t)addr.ip[13] << 16) |
-                        ((uint32_t)addr.ip[14] << 8) |
-                        (uint32_t)addr.ip[15];
-        netaddr.SetIPv4(ipv4);
-    } else {
-        // IPv6 address - pass raw bytes directly
-        netaddr.SetIPv6(addr.ip);
-    }
-
-    CService service(netaddr, addr.port);
-
-    // Add to AddrMan - bucket system handles deduplication and limits
-    // Must create CNetworkAddr (which extends CService) for proper Add()
-    CNetworkAddr networkAddr(service, addr.services, addr.time);
-    addrman.Add(networkAddr, CNetAddr());  // No source address for now
+    // Phase 1 port: IAddressManager takes (CAddress, CAddress source).
+    //
+    // BLOCKER fix per Cursor review (2026-04-26): pass addr as its own
+    // source. The legacy code passed an empty CNetAddr here, which made
+    // every unknown-origin address share source group [0,0]. Upstream's
+    // new-bucket math caps "addresses from one source group" at 64 buckets
+    // (ADDRMAN_NEW_BUCKETS_PER_SOURCE_GROUP) — sharing a source group
+    // collapses self-discovered addresses into 64/1024 = 6.25% of the
+    // bucket grid, weakening the eclipse-defense diversity property.
+    //
+    // Self-source restores diversity: each addr's group becomes its own
+    // source group, so addresses spread across the full 1024 new buckets.
+    // The "addr == source -> time_penalty = 0" early-return in AddInternal
+    // is the intended behavior for self-announced addresses, which is what
+    // an unknown-origin address effectively is.
+    addrman->Add(addr, addr);
 }
 
 std::vector<NetProtocol::CAddress> CPeerManager::QueryDNSSeeds() {
@@ -356,7 +468,7 @@ void CPeerManager::BanPeer(int peer_id, int64_t ban_time_seconds) {
         // Add IP to banned list using CBanManager
         std::string ip = it->second->addr.ToStringIP();
         banman.Ban(ip, ban_time_seconds, BanReason::NodeMisbehaving,
-                   MisbehaviorType::NONE, it->second->misbehavior_score);
+                   MisbehaviorType::NONE, GetMisbehaviorScore(peer_id));
     }
 }
 
@@ -387,13 +499,24 @@ void CPeerManager::ClearBans() {
     banman.ClearBanned();
 }
 
+// Phase 2 port: forwarder. Routes scoring through CPeerScorer (when enabled
+// via DILITHION_USE_NEW_PEER_SCORER, default ON), then performs the
+// post-threshold ban plumbing (Q2=A — caller, not scorer, calls banman.Ban).
+//
+// Signature unchanged from pre-cutover: all ~107 call sites compile as-is.
+// Behavior preserved:
+//   * Seed-node protection (never ban seeds for misbehavior)
+//   * Outdated-protocol-version uses short ban time (10min); other categories
+//     use default (1h)
+//   * CBanEntry populated with correct fields (banReason, misbehaviorType,
+//     score-at-ban-time)
+//   * Immediate CNode disconnect on ban (BUG #246)
 void CPeerManager::Misbehaving(int peer_id, int howmuch, MisbehaviorType type) {
     auto peer = GetPeer(peer_id);
     if (!peer) return;
 
-    // Seed node protection: never ban seed nodes for misbehavior.
-    // Seed nodes are trusted infrastructure - banning them causes total network isolation.
-    // Get peer IP to check against seed list.
+    // Seed-node protection: same logic as pre-cutover. Seed IPs are trusted
+    // infrastructure; banning them isolates the node.
     std::string peer_ip = peer->addr.ToStringIP();
     if (peer->addr.IsNull()) {
         std::lock_guard<std::recursive_mutex> node_lock(cs_nodes);
@@ -408,72 +531,99 @@ void CPeerManager::Misbehaving(int peer_id, int howmuch, MisbehaviorType type) {
         return;
     }
 
-    // Use default score from MisbehaviorType if howmuch is 0
-    int score = howmuch > 0 ? howmuch : GetMisbehaviorScore(type);
+    // Tracking-disabled mode (DILITHION_USE_NEW_PEER_SCORER=0): no scoring,
+    // no ban via misbehavior. Manual ban via RPC still works; protocol-level
+    // disconnects still fire.
+    if (!m_scorer) {
+        return;
+    }
 
-    if (peer->Misbehaving(score)) {
-        // Ban peer if threshold exceeded
-        std::lock_guard<std::recursive_mutex> lock(cs_peers);
+    // Resolve the actual weight: explicit (howmuch>0) overrides type default.
+    // ::GetMisbehaviorScore is the legacy helper from banman.h that maps the
+    // DIAGNOSTIC enum to weights — we keep it for legacy `type` parity. The
+    // scorer also has its own DefaultWeight() table for the FROZEN policy
+    // enum, but that's a different enum (see misbehavior_policy.h DELIBERATE
+    // DIVERGENCE block). Using the legacy helper here preserves call-site
+    // semantics for the ~107 existing callers.
+    const int score = howmuch > 0 ? howmuch : ::GetMisbehaviorScore(type);
 
-        // Use shorter ban time for outdated protocol version (10 min vs 1 hour)
-        // These are legitimate miners who just need to update, not attackers
-        int64_t ban_time = (type == MisbehaviorType::INVALID_PROTOCOL_VERSION)
-                           ? PROTOCOL_VERSION_BAN_TIME : DEFAULT_BAN_TIME;
+    // Score it. Threshold cross is the scorer's call.
+    const bool threshold_crossed = m_scorer->Misbehaving(peer_id, score, "");
+    if (!threshold_crossed) return;
 
-        int64_t ban_until = GetTime() + ban_time;
-        peer->Ban(ban_until);
+    // Threshold crossed — ban the peer. (Q2=A: forwarder, not scorer, owns
+    // banman + immediate disconnect plumbing.)
+    std::lock_guard<std::recursive_mutex> lock(cs_peers);
 
-        // BUG FIX: Get IP from peer first, fall back to CNode if peer's addr is null
-        // (race condition can cause peer->addr to be zeroed if AddPeerWithId runs before RegisterNode)
-        std::string ip = peer->addr.ToStringIP();
+    // Outdated protocol version gets a short ban (operator-friendly: legitimate
+    // miners just need to update). All other categories use the default 1h.
+    const int64_t ban_time = (type == MisbehaviorType::INVALID_PROTOCOL_VERSION)
+                              ? PROTOCOL_VERSION_BAN_TIME
+                              : DEFAULT_BAN_TIME;
 
-        // BUG #246 FIX: Immediately disconnect banned peer
-        // Mark the CNode for disconnect so CConnman removes it on next iteration
-        {
-            std::lock_guard<std::recursive_mutex> node_lock(cs_nodes);
-            auto it = node_refs.find(peer_id);
-            if (it != node_refs.end() && it->second) {
-                // BUG FIX: If peer's IP is null/zeroed, get it from CNode
-                if (peer->addr.IsNull() && !it->second->addr.IsNull()) {
-                    ip = it->second->addr.ToStringIP();
-                }
-                it->second->MarkDisconnect();
+    const int64_t ban_until = GetTime() + ban_time;
+    peer->Ban(ban_until);
+
+    // BUG FIX: Get IP from peer first, fall back to CNode if peer's addr is null
+    // (race condition can cause peer->addr to be zeroed if AddPeerWithId runs
+    // before RegisterNode).
+    std::string ip = peer->addr.ToStringIP();
+
+    // BUG #246 FIX: Immediately disconnect banned peer.
+    {
+        std::lock_guard<std::recursive_mutex> node_lock(cs_nodes);
+        auto it = node_refs.find(peer_id);
+        if (it != node_refs.end() && it->second) {
+            if (peer->addr.IsNull() && !it->second->addr.IsNull()) {
+                ip = it->second->addr.ToStringIP();
             }
+            it->second->MarkDisconnect();
         }
+    }
 
-        banman.Ban(ip, ban_time, BanReason::NodeMisbehaving,
-                   type, peer->misbehavior_score);
+    // Cumulative score at ban time — query scorer.
+    const int cumulative = m_scorer->GetScore(peer_id);
 
-        // Format ban duration for display
-        if (ban_time >= 3600) {
-            std::cout << "[BAN] Peer " << peer_id << " (" << ip
-                      << ") banned for " << (ban_time / 3600) << "h - "
-                      << MisbehaviorTypeToString(type)
-                      << " (score: " << peer->misbehavior_score << ")" << std::endl;
-        } else {
-            std::cout << "[BAN] Peer " << peer_id << " (" << ip
-                      << ") banned for " << (ban_time / 60) << "min - "
-                      << MisbehaviorTypeToString(type)
-                      << " (score: " << peer->misbehavior_score << ")" << std::endl;
-        }
+    banman.Ban(ip, ban_time, BanReason::NodeMisbehaving, type, cumulative);
+
+    // Phase 2 plan §10 Q1=C: cross-session badness signal flows through
+    // AddrMan's RecordAttempt(PeerMisbehaved) — biases future outbound
+    // selection AWAY from this peer's group across restarts. Without this
+    // wire-up the Q1=C decision wouldn't materialize: the scorer is
+    // transient by design, banlist.dat covers active bans, and the AddrMan
+    // bias is what carries the "this peer was bad" signal forward when the
+    // ban eventually expires.
+    //
+    // Cursor Phase 2 review Q16 (2026-04-26) flagged this as a missing
+    // piece of Q1=C; wire-up landed here. Test:
+    // peer_scorer_banman_integration_tests::test_misbehavior_signals_addrman.
+    if (addrman && !peer->addr.IsNull()) {
+        addrman->RecordAttempt(peer->addr,
+                               ::dilithion::net::ConnectionOutcome::PeerMisbehaved);
+    }
+
+    // Operator-facing log line — one per ban. Matches pre-cutover format.
+    if (ban_time >= 3600) {
+        std::cout << "[BAN] Peer " << peer_id << " (" << ip
+                  << ") banned for " << (ban_time / 3600) << "h - "
+                  << MisbehaviorTypeToString(type)
+                  << " (score: " << cumulative << ")" << std::endl;
+    } else {
+        std::cout << "[BAN] Peer " << peer_id << " (" << ip
+                  << ") banned for " << (ban_time / 60) << "min - "
+                  << MisbehaviorTypeToString(type)
+                  << " (score: " << cumulative << ")" << std::endl;
     }
 }
 
+// Phase 2 port: forwarder. Per-peer score decay lives in CPeerScorer; the
+// banman housekeeping (SweepExpiredBans + CleanupGenesisFailures) stays
+// here. Called every 30 seconds from the existing tick.
 void CPeerManager::DecayMisbehaviorScores() {
-    std::lock_guard<std::recursive_mutex> lock(cs_peers);
-
-    // BUG #49: Decay misbehavior scores over time
-    // Called every 30 seconds, decay by 0.5 points (1 point per minute)
-    for (auto& pair : peers) {
-        if (pair.second->misbehavior_score > 0) {
-            pair.second->misbehavior_score = std::max(0, pair.second->misbehavior_score - 1);
-        }
+    if (m_scorer) {
+        m_scorer->DecayAll();
     }
-
-    // Clean up expired bans using CBanManager
     banman.SweepExpiredBans();
-
-    // Clean up old genesis failure tracking entries
     banman.CleanupGenesisFailures();
 }
 
@@ -558,6 +708,18 @@ void CPeerManager::InitializeSeedNodes() {
     // Check which network we're on
     bool isTestnet = Dilithion::g_chainParams && Dilithion::g_chainParams->IsTestnet();
     bool isDilV = Dilithion::g_chainParams && Dilithion::g_chainParams->IsDilV();
+    bool isRegtest = Dilithion::g_chainParams && Dilithion::g_chainParams->IsRegtest();
+
+    // Regtest must NEVER reach out to public seed nodes. The 4-node harness
+    // wires peers via --addnode and the regtest network is air-gapped from
+    // mainnet/testnet/DilV public infra. Without this short-circuit, regtest
+    // falls through the isTestnet/isDilV checks into the mainnet branch and
+    // attempts to dial 138.197.68.128:8444 etc., which causes peer churn,
+    // CPU contention, and stalled mining templates.
+    if (isRegtest) {
+        dns_seeds.clear();
+        return;
+    }
 
     if (isDilV) {
         // ============================================
@@ -720,54 +882,22 @@ bool CPeerManager::IsSeedNode(const std::string& ip) const {
 // Address database management (NW-003 - now uses Bitcoin Core CAddrMan)
 
 void CPeerManager::MarkAddressGood(const NetProtocol::CAddress& addr) {
-    // Convert NetProtocol::CAddress to CService
-    CNetAddr netaddr;
-
-    // Check if IPv4-mapped address (::ffff:x.x.x.x)
-    static const uint8_t ipv4_mapped_prefix[12] = {0,0,0,0,0,0,0,0,0,0,0xff,0xff};
-    bool is_ipv4 = (memcmp(addr.ip, ipv4_mapped_prefix, 12) == 0);
-
-    if (is_ipv4) {
-        uint32_t ipv4 = ((uint32_t)addr.ip[12] << 24) |
-                        ((uint32_t)addr.ip[13] << 16) |
-                        ((uint32_t)addr.ip[14] << 8) |
-                        (uint32_t)addr.ip[15];
-        netaddr.SetIPv4(ipv4);
-    } else {
-        netaddr.SetIPv6(addr.ip);
-    }
-
-    // NOTE: Since we only call MarkAddressGood for OUTBOUND connections,
-    // addr.port is already the correct P2P port (18444 testnet / 8444 mainnet).
-    // Inbound connections are excluded at the call site (dilithion-node.cpp).
-    CService service(netaddr, addr.port);
-
-    // Mark as good in AddrMan (moves to tried table)
-    addrman.Good(service);
+    // Phase 1 port: IAddressManager dispatches via ConnectionOutcome. Success
+    // performs the equivalent of legacy Good() — promote to tried with
+    // test-before-evict on collision.
+    //
+    // NOTE: this is only called for OUTBOUND connections — addr.port is the
+    // correct P2P port (caller responsibility, not changed by the port).
+    addrman->RecordAttempt(addr, ::dilithion::net::ConnectionOutcome::Success);
 }
 
 void CPeerManager::MarkAddressTried(const NetProtocol::CAddress& addr) {
-    // Convert NetProtocol::CAddress to CService
-    CNetAddr netaddr;
-
-    // Check if IPv4-mapped address (::ffff:x.x.x.x)
-    static const uint8_t ipv4_mapped_prefix[12] = {0,0,0,0,0,0,0,0,0,0,0xff,0xff};
-    bool is_ipv4 = (memcmp(addr.ip, ipv4_mapped_prefix, 12) == 0);
-
-    if (is_ipv4) {
-        uint32_t ipv4 = ((uint32_t)addr.ip[12] << 24) |
-                        ((uint32_t)addr.ip[13] << 16) |
-                        ((uint32_t)addr.ip[14] << 8) |
-                        (uint32_t)addr.ip[15];
-        netaddr.SetIPv4(ipv4);
-    } else {
-        netaddr.SetIPv6(addr.ip);
-    }
-
-    CService service(netaddr, addr.port);
-
-    // Mark connection attempt in AddrMan (true = count as failure if it fails)
-    addrman.Attempt(service, true);
+    // Phase 1 port: legacy Attempt(addr, fCountFailure=true) maps to a
+    // count-failure outcome. Per the IAddressManager dispatch table:
+    // HandshakeFailed/Timeout/PeerMisbehaved all bump n_attempts; pick
+    // Timeout as the closest semantic match for the "we tried, no answer"
+    // flow this method represented in the legacy code.
+    addrman->RecordAttempt(addr, ::dilithion::net::ConnectionOutcome::Timeout);
 }
 
 std::vector<NetProtocol::CAddress> CPeerManager::SelectAddressesToConnect(int count) {
@@ -782,34 +912,28 @@ std::vector<NetProtocol::CAddress> CPeerManager::SelectAddressesToConnect(int co
     while ((int)result.size() < count && attempts < max_attempts) {
         attempts++;
 
-        // Select returns pair<CAddress, int64_t> where int64_t is last try time
-        auto [selected_addr, last_try] = addrman.Select();
-
-        // Check if valid address was returned
-        if (!selected_addr.IsValid()) {
+        // Phase 1 port: IAddressManager::Select returns optional<CAddress>
+        // directly (no wrapper pair, no CService intermediate). nullopt
+        // means the bucket walk found no candidates this iteration.
+        auto sel = addrman->Select(::dilithion::net::OutboundClass::FullRelay);
+        if (!sel.has_value()) {
             break;  // No more addresses available
         }
+        const NetProtocol::CAddress& selected_addr = *sel;
 
-        // Get IP string for deduplication
+        // Deduplicate by IP string (port-independent — multiple ports per IP
+        // is unusual on this network; single-port-per-host stays in result).
         std::string ip_str = selected_addr.ToStringIP();
         if (seen_ips.count(ip_str)) {
             continue;  // Skip duplicate
         }
         seen_ips.insert(std::move(ip_str));
 
-        // Convert CAddress (which inherits from CService/CNetAddr) back to NetProtocol::CAddress
-        NetProtocol::CAddress addr;
-        addr.services = NetProtocol::NODE_NETWORK;
-        addr.port = selected_addr.GetPort();
-        addr.time = GetTime();
-
-        // CService inherits from CNetAddr, so we can access CNetAddr methods directly
-        if (selected_addr.IsIPv4()) {
-            addr.SetIPv4(selected_addr.GetIPv4());
-        } else {
-            // Copy raw bytes from CNetAddr
-            memcpy(addr.ip, selected_addr.GetAddrBytes(), 16);
-        }
+        // Refresh time stamp to "now" for outbound-relay propagation —
+        // matches legacy behavior at this call site.
+        NetProtocol::CAddress addr = selected_addr;
+        addr.time = static_cast<uint32_t>(GetTime());
+        if (addr.services == 0) addr.services = NetProtocol::NODE_NETWORK;
 
         result.push_back(addr);
     }
@@ -819,7 +943,7 @@ std::vector<NetProtocol::CAddress> CPeerManager::SelectAddressesToConnect(int co
 }
 
 size_t CPeerManager::GetAddressCount() const {
-    return addrman.Size();
+    return addrman->Size();
 }
 
 bool CPeerManager::EvictPeersIfNeeded() {
@@ -849,7 +973,8 @@ bool CPeerManager::EvictPeersIfNeeded() {
         }
 
         // Calculate eviction score (higher = more likely to evict)
-        int score = peer->misbehavior_score;
+        // Phase 2 port: misbehavior score lives in CPeerScorer now.
+        int score = GetMisbehaviorScore(peer_id);
 
         // Prefer to evict peers with no recent activity (no messages in last 5 minutes)
         if (peer->last_recv > 0 && (now - peer->last_recv) > 5 * 60) {
@@ -875,8 +1000,8 @@ bool CPeerManager::EvictPeersIfNeeded() {
         int current_height = static_cast<int>(g_chain_height.load());
         bool trust_active = Dilithion::g_chainParams &&
                             current_height >= Dilithion::g_chainParams->trustWeightedNetworkHeight;
-        bool in_ibd = g_node_context.ibd_coordinator &&
-                      g_node_context.ibd_coordinator->IsInitialBlockDownload();
+        bool in_ibd = g_node_context.sync_coordinator &&
+                      g_node_context.sync_coordinator->IsInitialBlockDownload();
 
         if (trust_active && !in_ibd && g_node_context.GetPeerTrustScore) {
             for (auto& [pid, score] : eviction_candidates) {
@@ -901,6 +1026,13 @@ bool CPeerManager::EvictPeersIfNeeded() {
     if (peer) {
         LogPrintf(NET, INFO, "Evicting peer %d (score: %d, addr: %s)",
                   peer_to_evict, eviction_candidates[0].second, peer->addr.ToString().c_str());
+        // F22 (v4.3.3 Track B): eviction used RemovePeer only, bypassing
+        // CConnman::DispatchPeerDisconnected — port OnPeerDisconnected (F18+)
+        // never ran. Mirror DisconnectNodes ordering: dispatch first while
+        // CPeer/CNode state is still observable, then legacy map removal.
+        if (g_node_context.connman) {
+            g_node_context.connman->DispatchPeerDisconnected(peer_to_evict);
+        }
         RemovePeer(peer_to_evict);
         return true;
     }
@@ -1514,6 +1646,14 @@ void CPeerManager::OnPeerDisconnected(int peer_id)
         }
     }
 
+    // F19/F20/F21 (v4.3.3 Track B): leak-class cleanups — methods existed but
+    // had no production caller on the disconnect path.
+    if (g_node_context.headers_manager) {
+        g_node_context.headers_manager->OnPeerDisconnected(peer_id);
+    }
+    connection_quality.RemovePeer(peer_id);
+    m_peer_bandwidth_throttle.RemovePeer(peer_id);
+
     // The actual peer removal is handled by RemovePeer()
 }
 
@@ -1622,6 +1762,11 @@ void CPeerManager::RemoveNode(int node_id) {
 
     peers.erase(node_id);
     node_refs.erase(node_id);
+
+    // Phase 2 port: reclaim the scorer's map slot. Same reasoning as
+    // RemovePeer above — bounded by MAX_TOTAL_CONNECTIONS in practice but
+    // unbounded if ResetScore is forgotten on any disconnect path.
+    if (m_scorer) m_scorer->ResetScore(node_id);
 }
 
 CNode* CPeerManager::GetNode(int node_id) {

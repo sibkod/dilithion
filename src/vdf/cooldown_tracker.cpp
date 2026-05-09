@@ -1,6 +1,7 @@
 #include "cooldown_tracker.h"
 #include <algorithm>
 #include <iostream>
+#include <set>
 
 int CCooldownTracker::CalculateCooldown(int activeMiners)
 {
@@ -14,9 +15,20 @@ int CCooldownTracker::CalculateCooldown(int activeMiners)
     return std::clamp(cooldown, MIN_COOLDOWN, MAX_COOLDOWN);
 }
 
-int CCooldownTracker::ComputeEffectiveCooldown(int height) const
+int CCooldownTracker::ComputeEffectiveCooldownUnlocked(int height) const
 {
     // Caller must hold m_mutex.
+    //
+    // v4.2.0 MED-E note: above m_timeDecayActivationHeight, this function is
+    // called by the time-decay path in IsInCooldown. The dual-window blend
+    // below (long ∩ short) is preserved AS-IS — under v4.2 it composes with
+    // the time-decay rule rather than replacing it. On DilV mainnet
+    // m_shortWindow=0 (chainparams `vdfCooldownShortWindow=0`), so the blend
+    // is a no-op and the spec's "single self-correcting rule" property
+    // holds. **INVARIANT for v4.2 deployments: vdfCooldownShortWindow MUST
+    // remain 0 above the time-decay activation height.** A non-zero value
+    // would compose the short-window-min cooldown with time-decay in a way
+    // the spec never analyzed and which the v4.2 unit tests do not cover.
     RecalcActiveMiners(height);
     int longCooldown = CalculateCooldown(m_cachedActiveMinersMut);
 
@@ -38,7 +50,54 @@ bool CCooldownTracker::IsInCooldown(const Address& addr, int height, int64_t cur
     if (it == m_lastWinHeight.end())
         return false;
 
-    int cooldown = ComputeEffectiveCooldown(height);
+    // ----------------------------------------------------------------------
+    // v4.2.0 — TIME-DECAY COOLDOWN PATH
+    // ----------------------------------------------------------------------
+    // At and above m_timeDecayActivationHeight, the legacy block-only +
+    // stall-exemption logic is REPLACED by a single self-correcting rule:
+    //
+    //   effective_cooldown = max(0, cooldown_blocks - max(0, time_since)/decay)
+    //   in_cooldown        = blocks_since < effective_cooldown
+    //
+    // This subsumes the V1/V2 stall exemption tiers, the time-based expiry,
+    // and the post-stabilization branching at chain.cpp:1339-1500. See
+    // .claude/contracts/v4_2_time_decay_cooldown_spec.md.
+    //
+    // CheckConsecutiveMiner and CheckMIKWindowCap remain ACTIVE alongside
+    // this path — they enforce orthogonal invariants (no same MIK twice in a
+    // row; aggregate window cap) that time-decay does NOT subsume.
+    if (height >= m_timeDecayActivationHeight) {
+        int blocksSince = height - it->second;
+        int cooldownBlocks = ComputeEffectiveCooldownUnlocked(height);
+
+        // HIGH-3: clamp time_since to non-negative. Block timestamps may
+        // legally regress (only median-of-11 must monotonically increase).
+        // Without the clamp, negative time_since with integer division
+        // produces a negative time_decrement, and the subtraction below
+        // would EXTEND cooldown beyond the block-count baseline (more
+        // restrictive than v4.1) — wrong direction. The clamp guarantees
+        // the time-decay path can only soften cooldown, never extend it.
+        int64_t timeSince = 0;
+        auto tsIt = m_lastWinTimestamp.find(addr);
+        if (tsIt != m_lastWinTimestamp.end() && tsIt->second > 0
+                                             && currentTimestamp > 0) {
+            timeSince = currentTimestamp - tsIt->second;
+            if (timeSince < 0) timeSince = 0;
+        }
+
+        // LOW-1: int64_t to avoid overflow at absurd offline durations.
+        const int decay = (m_timeDecaySeconds > 0) ? m_timeDecaySeconds : 60;
+        int64_t timeDecrement = timeSince / decay;
+        int64_t effective = std::max<int64_t>(0,
+            static_cast<int64_t>(cooldownBlocks) - timeDecrement);
+
+        return static_cast<int64_t>(blocksSince) < effective;
+    }
+
+    // ----------------------------------------------------------------------
+    // LEGACY PATH (height < m_timeDecayActivationHeight) — UNCHANGED
+    // ----------------------------------------------------------------------
+    int cooldown = ComputeEffectiveCooldownUnlocked(height);
     int blockGap = height - it->second;
 
     // Block-gap expiry: not in cooldown if enough blocks have passed
@@ -73,7 +132,26 @@ bool CCooldownTracker::IsInCooldownExcludingHeight(const Address& addr, int heig
     if (excludeHeight < 0 || m_heightToWinner.find(excludeHeight) == m_heightToWinner.end()) {
         auto it = m_lastWinHeight.find(addr);
         if (it == m_lastWinHeight.end()) return false;
-        int cooldown = ComputeEffectiveCooldown(height);
+
+        // v4.2.0: time-decay path (mirror of IsInCooldown above-activation branch)
+        if (height >= m_timeDecayActivationHeight) {
+            int blocksSince = height - it->second;
+            int cooldownBlocks = ComputeEffectiveCooldownUnlocked(height);
+            int64_t timeSince = 0;
+            auto tsIt = m_lastWinTimestamp.find(addr);
+            if (tsIt != m_lastWinTimestamp.end() && tsIt->second > 0
+                                                 && currentTimestamp > 0) {
+                timeSince = currentTimestamp - tsIt->second;
+                if (timeSince < 0) timeSince = 0;
+            }
+            const int decay = (m_timeDecaySeconds > 0) ? m_timeDecaySeconds : 60;
+            int64_t timeDecrement = timeSince / decay;
+            int64_t effective = std::max<int64_t>(0,
+                static_cast<int64_t>(cooldownBlocks) - timeDecrement);
+            return static_cast<int64_t>(blocksSince) < effective;
+        }
+
+        int cooldown = ComputeEffectiveCooldownUnlocked(height);
         int blockGap = height - it->second;
         if (blockGap >= cooldown) return false;
         // v4.0.22: gated time-based expiry (see IsInCooldown for rationale)
@@ -141,6 +219,25 @@ bool CCooldownTracker::IsInCooldownExcludingHeight(const Address& addr, int heig
     }
 
     int blockGap = height - it->second;
+
+    // v4.2.0: time-decay path on simulated state (mirror of IsInCooldown
+    // above-activation branch, but using simLastWinTs for the timestamp
+    // lookup so the excluded height is reflected correctly)
+    if (height >= m_timeDecayActivationHeight) {
+        int64_t timeSince = 0;
+        auto tsIt = simLastWinTs.find(addr);
+        if (tsIt != simLastWinTs.end() && tsIt->second > 0
+                                       && currentTimestamp > 0) {
+            timeSince = currentTimestamp - tsIt->second;
+            if (timeSince < 0) timeSince = 0;
+        }
+        const int decay = (m_timeDecaySeconds > 0) ? m_timeDecaySeconds : 60;
+        int64_t timeDecrement = timeSince / decay;
+        int64_t effective = std::max<int64_t>(0,
+            static_cast<int64_t>(cooldown) - timeDecrement);
+        return static_cast<int64_t>(blockGap) < effective;
+    }
+
     if (blockGap >= cooldown) return false;
 
     // v4.0.22: gated time-based expiry (see IsInCooldown for rationale)
@@ -240,7 +337,7 @@ int CCooldownTracker::GetLastWinHeight(const Address& addr) const
 int CCooldownTracker::GetEffectiveCooldown(int height) const
 {
     std::lock_guard<std::mutex> lock(m_mutex);
-    return ComputeEffectiveCooldown(height);
+    return ComputeEffectiveCooldownUnlocked(height);
 }
 
 void CCooldownTracker::OnBlockConnected(int height, const Address& winner, int64_t blockTimestamp)
@@ -253,6 +350,11 @@ void CCooldownTracker::OnBlockConnected(int height, const Address& winner, int64
     // v4.0.21 — Patch C: increment lifetime block count for this winner.
     // Deterministic: pure function of canonical chain state.
     m_lifetimeBlockCount[winner]++;
+
+    // v4.1.2 — record this height in the per-MIK lifetime multiset for
+    // height-bounded lifetime queries (GetLifetimeMinerCountAtHeight).
+    // NOT evicted by the sliding-window logic below.
+    m_mikHeights[winner].insert(height);
 
     // Store timestamp for time-based expiry
     if (blockTimestamp > 0) {
@@ -284,12 +386,44 @@ void CCooldownTracker::OnBlockDisconnected(int height)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
 
-    auto it = m_heightToWinner.find(height);
-    if (it == m_heightToWinner.end())
-        return;
+    // Identify the winner. Fast path: m_heightToWinner (sliding window;
+    // covers normal disconnects within m_activeWindow of tip).
+    // Fallback: scan m_mikHeights for the height — supports deep-reorg
+    // disconnects of evicted heights (rare; reorg-completeness per
+    // v4.1.2 design). O(distinct_MIKs) but only walked on the rare path.
+    Address winner{};
+    bool foundWinner = false;
+    bool foundInSlidingWindow = false;
 
-    Address winner = it->second;
-    m_heightToWinner.erase(it);
+    auto it = m_heightToWinner.find(height);
+    if (it != m_heightToWinner.end()) {
+        winner = it->second;
+        foundWinner = true;
+        foundInSlidingWindow = true;
+    } else {
+        for (const auto& [mik, heights] : m_mikHeights) {
+            if (heights.count(height) > 0) {
+                winner = mik;
+                foundWinner = true;
+                break;
+            }
+        }
+        if (!foundWinner) {
+            // Height was never tracked. No-op (consistent with prior behavior).
+            return;
+        }
+    }
+
+    // Sliding-window-keyed cleanup. m_heightToWinner is sliding-window only,
+    // so it's only erased on the fast path. But m_heightToTimestamp and
+    // m_heightToRegistration are keyed by height and may carry entries from
+    // disconnect paths regardless of whether m_heightToWinner had this height
+    // (Layer 3 registration tracking in particular is consensus-relevant
+    // metadata that must never go stale under reorg). Erase unconditionally
+    // for the disconnected height; erase() of a missing key is a safe no-op.
+    if (foundInSlidingWindow) {
+        m_heightToWinner.erase(it);
+    }
     m_heightToTimestamp.erase(height);
     m_heightToRegistration.erase(height);  // Layer 3: undo registration tracking
 
@@ -303,28 +437,46 @@ void CCooldownTracker::OnBlockDisconnected(int height)
         }
     }
 
-    // Recompute the address's last win height from remaining entries.
-    // Scan backwards from the end of m_heightToWinner.
-    int lastWin = -1;
-    for (auto rit = m_heightToWinner.rbegin(); rit != m_heightToWinner.rend(); ++rit) {
-        if (rit->second == winner) {
-            lastWin = rit->first;
-            break;
+    // v4.1.2 — erase ONE matching height entry from the lifetime multiset.
+    // If the multiset becomes empty, remove the MIK entry entirely so
+    // GetLifetimeMinerCountAtHeight returns the accurate count.
+    auto mhIt = m_mikHeights.find(winner);
+    if (mhIt != m_mikHeights.end()) {
+        auto found = mhIt->second.find(height);
+        if (found != mhIt->second.end()) {
+            mhIt->second.erase(found);  // erase ONE entry, not all matches
+        }
+        if (mhIt->second.empty()) {
+            m_mikHeights.erase(mhIt);
         }
     }
 
-    if (lastWin >= 0) {
-        m_lastWinHeight[winner] = lastWin;
-        // Recover timestamp from height→timestamp map
-        auto tsIt = m_heightToTimestamp.find(lastWin);
-        if (tsIt != m_heightToTimestamp.end()) {
-            m_lastWinTimestamp[winner] = tsIt->second;
+    // Sliding-window-relative bookkeeping (m_lastWinHeight / m_lastWinTimestamp)
+    // is only valid when the disconnected height was in the window. For
+    // evicted-height disconnects, m_lastWinHeight already lost any reference
+    // to this height at eviction time (or has a more-recent entry that the
+    // disconnect doesn't invalidate). No fixup needed in that case.
+    if (foundInSlidingWindow) {
+        int lastWin = -1;
+        for (auto rit = m_heightToWinner.rbegin(); rit != m_heightToWinner.rend(); ++rit) {
+            if (rit->second == winner) {
+                lastWin = rit->first;
+                break;
+            }
+        }
+
+        if (lastWin >= 0) {
+            m_lastWinHeight[winner] = lastWin;
+            auto tsIt = m_heightToTimestamp.find(lastWin);
+            if (tsIt != m_heightToTimestamp.end()) {
+                m_lastWinTimestamp[winner] = tsIt->second;
+            } else {
+                m_lastWinTimestamp.erase(winner);
+            }
         } else {
+            m_lastWinHeight.erase(winner);
             m_lastWinTimestamp.erase(winner);
         }
-    } else {
-        m_lastWinHeight.erase(winner);
-        m_lastWinTimestamp.erase(winner);
     }
 
     // Invalidate caches so next query recalculates.
@@ -341,6 +493,7 @@ void CCooldownTracker::Clear()
     m_heightToTimestamp.clear();
     m_heightToRegistration.clear();
     m_lifetimeBlockCount.clear();  // v4.0.21 — Patch C
+    m_mikHeights.clear();          // v4.1.2 — lifetime multiset per MIK
     m_cachedActiveMinersMut = 0;
     m_cachedAtHeightMut = -1;
     m_cachedShortActiveMinersMut = 0;
@@ -356,6 +509,32 @@ int CCooldownTracker::GetLifetimeMinerCount() const
 {
     std::lock_guard<std::mutex> lock(m_mutex);
     return static_cast<int>(m_lifetimeBlockCount.size());
+}
+
+int CCooldownTracker::GetLifetimeMinerCountAtHeight(int atHeight) const
+{
+    // v4.1.2 — read m_mikHeights (lifetime, never evicted). For each MIK
+    // with a non-empty multiset, count it iff its earliest-recorded
+    // mining height is <= atHeight (*multiset.begin() <= atHeight).
+    //
+    // Pre-v4.1.2 this walked m_heightToWinner, which is a sliding window
+    // of size m_activeWindow. As tip advanced past atHeight by activeWindow
+    // blocks, entries with key <= atHeight were evicted, and the count
+    // drifted. Three of four DilV mainnet seeds crashed-looped on
+    // 2026-05-02 because of this. The HIGH-2 audit's test only covered
+    // the increment direction (count doesn't go up); the failing
+    // direction (count goes down as window slides) was untested. See
+    // v4_1_lifetime_validator_bug.md for the post-mortem and
+    // feedback_storage_of_record_invariant.md for the project rule
+    // derived from this incident.
+    std::lock_guard<std::mutex> lock(m_mutex);
+    int count = 0;
+    for (const auto& [mik, heights] : m_mikHeights) {
+        if (!heights.empty() && *heights.begin() <= atHeight) {
+            ++count;
+        }
+    }
+    return count;
 }
 
 void CCooldownTracker::RecalcActiveMiners(int height) const

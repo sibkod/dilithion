@@ -64,17 +64,33 @@ public:
      *      observed during 2026-04-25 incident: time-based expiry let one
      *      miner win 3 consecutive blocks because each was >360s after the
      *      previous (cooldown=8 * targetBlockTime=45 = 360s). 999999999 =
-     *      time-based expiry never retired (legacy behaviour). */
+     *      time-based expiry never retired (legacy behaviour).
+     *  timeDecayActivationHeight: v4.2.0 — height at which the time-decay
+     *      cooldown rule activates. At and above this height, IsInCooldown
+     *      uses the new self-correcting rule:
+     *          effective_cooldown = max(0, cooldown_blocks
+     *                                   - max(0, time_since) / decay_seconds)
+     *      A miner is in cooldown iff blocks_since < effective_cooldown.
+     *      This subsumes the v4.1 stall-exemption-tier system. Below this
+     *      height, the legacy v4.0.22 / v4.1 paths run unchanged.
+     *      999999999 = disabled (legacy paths only).
+     *  timeDecaySeconds: seconds of wall-clock that drain 1 cooldown-block
+     *      under the time-decay rule. Default 60 (mainnet). Only consulted
+     *      when timeDecayActivationHeight is reached. */
     explicit CCooldownTracker(int activeWindow = ACTIVE_WINDOW,
                               int shortWindow = 0,
                               int activationHeight = 999999999,
                               int targetBlockTime = 45,
-                              int timeBasedExpiryRetiredHeight = 999999999)
+                              int timeBasedExpiryRetiredHeight = 999999999,
+                              int timeDecayActivationHeight = 999999999,
+                              int timeDecaySeconds = 60)
         : m_activeWindow(activeWindow),
           m_shortWindow(shortWindow),
           m_stabilizationHeight(activationHeight),
           m_targetBlockTime(targetBlockTime),
-          m_timeBasedExpiryRetiredHeight(timeBasedExpiryRetiredHeight) {}
+          m_timeBasedExpiryRetiredHeight(timeBasedExpiryRetiredHeight),
+          m_timeDecayActivationHeight(timeDecayActivationHeight),
+          m_timeDecaySeconds(timeDecaySeconds > 0 ? timeDecaySeconds : 60) {}
 
     /** Compute cooldown from active miner count. */
     static int CalculateCooldown(int activeMiners);
@@ -82,10 +98,35 @@ public:
     /** Active window size this instance was constructed with. */
     int GetActiveWindow() const { return m_activeWindow; }
 
+    /** v4.2.0: time-decay activation height this instance was constructed with. */
+    int GetTimeDecayActivationHeight() const { return m_timeDecayActivationHeight; }
+
+    /** v4.2.0: decay rate in seconds (1 cooldown-block drains per N seconds). */
+    int GetTimeDecaySeconds() const { return m_timeDecaySeconds; }
+
+    /** v4.2.0: whether the time-decay path is the binding cooldown rule at `height`. */
+    bool IsTimeDecayActive(int height) const {
+        return height >= m_timeDecayActivationHeight;
+    }
+
     // --- Query interface ---
 
     /** Is this address currently in cooldown at the given height?
-     *  currentTimestamp: block timestamp for time-based expiry (0 = disabled). */
+     *  currentTimestamp: block timestamp.
+     *
+     *  Below `m_timeDecayActivationHeight` (legacy path):
+     *      currentTimestamp = 0 disables time-based expiry; only block-count cooldown applies.
+     *
+     *  At or above `m_timeDecayActivationHeight` (v4.2.0 time-decay path):
+     *      **PRECONDITION: currentTimestamp MUST be > 0.**
+     *      Passing 0 above activation is a programming error — the time-decay
+     *      formula needs a real timestamp. The implementation treats
+     *      `currentTimestamp == 0` as the strictly-conservative case (no
+     *      time-decay drain, equivalent to pure block-count cooldown — i.e.
+     *      the function returns the SAFER answer "in cooldown" more often,
+     *      never returns "eligible" when it shouldn't), but this is a safety
+     *      fallback, not intended semantics. Consensus callers (chain.cpp,
+     *      vdf_validation.cpp) MUST pass `block.nTime`. */
     bool IsInCooldown(const Address& addr, int height, int64_t currentTimestamp = 0) const;
     /** Option C simulation helper:
      *  evaluate cooldown as if `excludeHeight` were disconnected first.
@@ -111,6 +152,26 @@ public:
      *  See OnBlockConnected/OnBlockDisconnected for the per-MIK count maintenance.
      *  Reloaded by replaying connect events from genesis on startup. */
     int GetLifetimeMinerCount() const;
+
+    /** Count of distinct MIK identities that mined at least one block at
+     *  or below the given height. Reads m_mikHeights (lifetime, never
+     *  evicted) — for each MIK with a non-empty multiset of mining
+     *  heights, counts it iff *multiset.begin() <= atHeight. Used by
+     *  ValidateLifetimeMinerSnapshot to compare the populator's running
+     *  tally against the canonical embedded snapshot at h=44232 —
+     *  without conflating with new MIKs that joined post-rollback at
+     *  heights > 44232.
+     *
+     *  v4.1.2 hotfix (storage-of-record-correctness fix): the v4.1
+     *  HIGH-2 audit fix walked m_heightToWinner, which is a SLIDING
+     *  WINDOW (eviction in OnBlockConnected). Once tip advanced past
+     *  44232 by activeWindow blocks, the queried range no longer
+     *  contained the canonical heights, so the count drifted as the
+     *  window slid. This now reads m_mikHeights, which is lifetime-
+     *  scope and parallel to m_lifetimeBlockCount. The result is
+     *  invariant in tip position for any fixed atHeight on the same
+     *  canonical chain. */
+    int GetLifetimeMinerCountAtHeight(int atHeight) const;
 
     /** All MIK addresses that have ever mined (for DNA discovery). */
     std::vector<Address> GetKnownAddresses() const;
@@ -170,13 +231,25 @@ private:
     int m_activeWindow{ACTIVE_WINDOW};      // long window
     int m_shortWindow{0};                   // short window (0 = disabled)
     int m_stabilizationHeight{999999999};   // activation height for dual-window + time expiry
-    int m_targetBlockTime{45};              // seconds per block
+    // m_targetBlockTime: LEGACY-ONLY (pre-timeDecayActivationHeight). Used by
+    // the v4.0.22 time-based-expiry calculation in IsInCooldown's legacy
+    // branch. Above the v4.2.0 activation, the time-decay rule uses
+    // m_timeDecaySeconds instead — m_targetBlockTime is unread.
+    int m_targetBlockTime{45};              // seconds per block (LEGACY-ONLY, see above)
     int m_timeBasedExpiryRetiredHeight{999999999};  // v4.0.22: above this height, block-only cooldown
+    int m_timeDecayActivationHeight{999999999};     // v4.2.0: above this height, time-decay rule replaces stall exemption
+    int m_timeDecaySeconds{60};                     // v4.2.0: 60s wall-clock drains 1 cooldown-block
 
     // address → height of most recent win
     std::map<Address, int> m_lastWinHeight;
 
-    // height → winner address (for undo on disconnect)
+    // height → winner address.
+    // SLIDING WINDOW — entries are evicted in OnBlockConnected when
+    // (height < tip - m_activeWindow + 1). This map is for ACTIVE-WINDOW
+    // queries (cooldown calculation, recent-winner undo) only.
+    // DO NOT read for archival/lifetime queries — use m_mikHeights or
+    // m_lifetimeBlockCount instead. The 2026-05-02 v4.1.1 incident was
+    // caused by GetLifetimeMinerCountAtHeight reading this map.
     std::map<int, Address> m_heightToWinner;
 
     // address → timestamp of most recent win (for time-based expiry)
@@ -197,6 +270,19 @@ private:
     // genesis on startup (NOT from sliding window).
     std::map<Address, int> m_lifetimeBlockCount;
 
+    // v4.1.2 — per-MIK multiset of mining heights on the active chain.
+    // LIFETIME SCOPE: NOT evicted in OnBlockConnected. Inserts on connect,
+    // erases one matching height on disconnect. When a MIK's multiset
+    // becomes empty, the entry is erased.
+    // Used by GetLifetimeMinerCountAtHeight: a MIK is counted at height h
+    // iff its multiset is non-empty AND *multiset.begin() <= h.
+    // Reorg-complete: the multiset stores ALL active heights for each MIK,
+    // so disconnects always have exact information about the new minimum
+    // even if some heights have been evicted from m_heightToWinner.
+    // Deterministic: same canonical chain → same map state regardless of
+    // tip position or node restart history.
+    std::map<Address, std::multiset<int>> m_mikHeights;
+
     /** Recount active miners up to `height` (long window).  Caller must hold m_mutex. */
     void RecalcActiveMiners(int height) const;
 
@@ -204,7 +290,7 @@ private:
     void RecalcShortActiveMiners(int height) const;
 
     /** Compute effective cooldown.  Caller must hold m_mutex. */
-    int ComputeEffectiveCooldown(int height) const;
+    int ComputeEffectiveCooldownUnlocked(int height) const;
 
     // Lazy cache for active miner count (mutable for const query methods).
     mutable int m_cachedActiveMinersMut{0};

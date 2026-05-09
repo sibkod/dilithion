@@ -25,6 +25,7 @@
 class CPeerManager;
 class CNetMessageProcessor;
 
+
 /**
  * Connection manager options
  */
@@ -100,7 +101,12 @@ public:
      * @param manual True for --connect/--addnode/RPC addnode peers (Bitcoin Core pattern)
      * @return CNode pointer on success, nullptr on failure
      */
-    CNode* ConnectNode(const NetProtocol::CAddress& addr, bool manual = false);
+    // Phase 4 port: connection class added (default FullRelay matches
+    // pre-port behaviour). `manual=true` overrides the class to Manual.
+    CNode* ConnectNode(
+        const NetProtocol::CAddress& addr,
+        bool manual = false,
+        CNode::OutboundClass cls = CNode::OutboundClass::FullRelay);
 
     /**
      * Add a manual node for auto-reconnect tracking
@@ -388,6 +394,15 @@ private:
     std::vector<NetProtocol::CAddress> m_manual_nodes;
     mutable std::mutex cs_manual_nodes;
 
+    // v4.2.0: throttle the "Outbound connection limit reached" warning to
+    // once per 60s. The connection-attempt scheduler retries frequently
+    // while at capacity (the at-limit state is persistent on a healthy
+    // mesh), so without throttling each attempt produces an identical WARN
+    // line, drowning the log. Stores the unix timestamp of the last
+    // emission; comparison uses unsigned-safe arithmetic.
+    static constexpr int64_t OUTBOUND_LIMIT_LOG_INTERVAL_SECONDS = 60;
+    mutable std::atomic<int64_t> m_outbound_limit_log_last{0};
+
 public:
     // When true (--connect used), skip hardcoded seed connections and AddrMan.
     // Only connect to manually specified nodes.
@@ -418,6 +433,33 @@ private:
     CPeerManager* m_peer_manager = nullptr;
     CNetMessageProcessor* m_msg_processor = nullptr;
     MessageHandler m_msg_handler;
+
+public:
+    // Test-only: set the legacy m_peer_manager pointer without going through
+    // Start(). Production code wires this via Start(peer_mgr, msg_proc, options).
+    // Originally written for Phase 6 PR6.5b.1b dual-dispatch tests; dual-dispatch
+    // wiring was retired in v4.3.4 Option C cut Block 6, but the test seam still
+    // serves the regression-gate test (legacy_block_arrival_chainsel_gate_tests)
+    // and any future test wanting legacy CPeerManager wired without I/O.
+    // Restricted to test fixtures by convention.
+    void SetTestPeerManager(::CPeerManager& pm) {
+        m_peer_manager = &pm;
+    }
+
+    // Test-only: invoke the private ProcessQueuedMessage without spinning up
+    // the BlocksWorker / HeadersWorker / inline control-thread path. Used by
+    // PR6.5b.2 (v4.3) connman block-routing tests to exercise the port-
+    // CPeerManager dispatch path deterministically. Restricted to test
+    // fixtures by convention; matches SetTestPeerManager's "Test-only" tag.
+    bool TestProcessQueuedMessage(int node_id, const std::string& command,
+                                  const std::vector<uint8_t>& data) {
+        return ProcessQueuedMessage(QueuedMessage{node_id, command, data});
+    }
+
+    // Centralized wrappers for legacy peer-event handling.
+    bool DispatchPeerConnected(int node_id, CNode* pnode,
+                               const NetProtocol::CAddress& addr, bool inbound);
+    void DispatchPeerDisconnected(int node_id);
 };
 
 #endif // DILITHION_NET_CONNMAN_H

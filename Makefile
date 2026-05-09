@@ -143,6 +143,25 @@ DILITHIUM_OBJECTS := $(DILITHIUM_SOURCES:.c=.o)
 BUILD_DIR := build
 OBJ_DIR := $(BUILD_DIR)/obj
 
+# Phase 6 sub-stream (b) — Thread Sanitizer build mode.
+# Usage:   make TSAN=1 <target>
+# Example: make TSAN=1 reorg_wal_crash_injection_tests
+# Run the resulting binary directly; TSAN prints a race report on stderr
+# and exits non-zero if a data race is detected. TSAN-built objects go to
+# build-tsan/ to keep them separate from the normal build artifacts. To
+# switch between TSAN and non-TSAN cleanly, run `make clean` first
+# (dilithium .o files live in depends/dilithium/ref/ and are shared
+# across modes — clean rebuilds them with the correct flags).
+# Requires GCC 4.8+ (Linux) with libtsan; NOT supported on MSYS2 mingw64.
+ifdef TSAN
+    TSAN_FLAGS := -fsanitize=thread -fno-omit-frame-pointer
+    CXXFLAGS += $(TSAN_FLAGS)
+    CFLAGS += $(TSAN_FLAGS)
+    LDFLAGS += $(TSAN_FLAGS)
+    BUILD_DIR := build-tsan
+    OBJ_DIR := $(BUILD_DIR)/obj
+endif
+
 # Colors for output
 COLOR_RESET := \033[0m
 COLOR_GREEN := \033[32m
@@ -162,7 +181,8 @@ CONSENSUS_SOURCES := src/consensus/fees.cpp \
                      src/consensus/tx_validation.cpp \
                      src/consensus/signature_batch_verifier.cpp \
                      src/consensus/validation.cpp \
-                     src/consensus/vdf_validation.cpp
+                     src/consensus/vdf_validation.cpp \
+                     src/consensus/port/chain_selector_impl.cpp
 
 CORE_SOURCES_UTIL := src/core/chainparams.cpp \
                      src/core/globals.cpp \
@@ -227,11 +247,14 @@ NET_SOURCES := src/net/protocol.cpp \
                src/net/tx_relay.cpp \
                src/net/async_broadcaster.cpp \
                src/net/headers_manager.cpp \
-               src/net/chain_tips_tracker.cpp \
                src/net/orphan_manager.cpp \
                src/net/block_fetcher.cpp \
                src/net/netaddress.cpp \
                src/net/addrman.cpp \
+               src/net/port/addrman_v2.cpp \
+               src/net/port/addrman_migrator.cpp \
+               src/net/port/peer_scorer.cpp \
+               src/net/port/sync_coordinator_adapter.cpp \
                src/net/banman.cpp \
                src/net/headerssync.cpp \
                src/net/blockencodings.cpp \
@@ -259,7 +282,8 @@ NODE_SOURCES := src/node/block_index.cpp \
                 src/node/validation_watchdog.cpp \
                 src/node/resource_monitor.cpp \
                 src/node/peer_mik_tracker.cpp \
-                src/node/registration_manager.cpp
+                src/node/registration_manager.cpp \
+                src/node/startup_checkpoint_validator.cpp
 
 PRIMITIVES_SOURCES := src/primitives/block.cpp \
                       src/primitives/transaction.cpp
@@ -442,6 +466,14 @@ inspect_db: $(CORE_OBJECTS) $(OBJ_DIR)/tools/inspect_db.o $(DILITHIUM_OBJECTS) $
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 	@echo "$(COLOR_GREEN)✓ inspect_db built successfully$(COLOR_RESET)"
 
+# Phase 5 Day 5: leveldb state-hash tool for V2 byte-equivalence testing.
+# Computes SHA3-256 of sorted (key,value) entries; comparing two outputs
+# proves byte-level equivalence of two LevelDB databases.
+leveldb_state_hash: $(CORE_OBJECTS) $(OBJ_DIR)/tools/leveldb_state_hash.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ leveldb_state_hash built successfully$(COLOR_RESET)"
+
 check-wallet-balance: $(CORE_OBJECTS) $(OBJ_DIR)/check-wallet-balance.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
@@ -456,7 +488,7 @@ dilv-genesis-vdf: $(CORE_OBJECTS) $(OBJ_DIR)/tools/dilv_genesis_vdf.o $(DILITHIU
 # Test Binaries
 # ============================================================================
 
-tests: phase1_test miner_tests wallet_tests rpc_tests rpc_auth_tests timestamp_tests crypter_tests wallet_encryption_integration_tests wallet_persistence_tests integration_tests net_tests connman_tests tx_validation_tests tx_relay_tests mining_integration_tests dfmp_mik_tests mik_registration_persistence_tests dna_propagation_tests test_passphrase_validator script_tests
+tests: phase1_test miner_tests wallet_tests rpc_tests rpc_auth_tests timestamp_tests crypter_tests wallet_encryption_integration_tests wallet_persistence_tests integration_tests net_tests connman_tests tx_validation_tests tx_relay_tests mining_integration_tests dfmp_mik_tests mik_registration_persistence_tests dna_propagation_tests test_passphrase_validator script_tests addrman_v2_tests peer_scorer_tests peer_scorer_banman_integration_tests header_proof_checker_tests chain_selector_tests getchaintips_equivalence_tests chain_case_2_5_equivalence_tests chain_work_smoke_tests reorg_wal_crash_injection_tests competing_sibling_below_checkpoint_tests headers_manager_to_chain_selector_wiring_tests fast_path_2_boundary_tests v4_1_checkpoint_enforcement_tests v4_1_chain_selector_suppression_tests auto_rebuild_marker_mode_symmetry_tests add_block_index_flag_merge_tests port_chain_selector_invariants_tests legacy_vs_port_differential_tests
 	@echo "$(COLOR_GREEN)✓ All tests built successfully$(COLOR_RESET)"
 
 phase1_test: $(CORE_OBJECTS) $(OBJ_DIR)/test/phase1_simple_test.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
@@ -560,6 +592,171 @@ script_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/script_tests.o $(DILITHIUM_OBJECTS
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 	@echo "$(COLOR_GREEN)✓ script_tests built successfully$(COLOR_RESET)"
 
+addrman_v2_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/addrman_v2_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ addrman_v2_tests built successfully$(COLOR_RESET)"
+
+peer_scorer_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/peer_scorer_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ peer_scorer_tests built successfully$(COLOR_RESET)"
+
+peer_scorer_banman_integration_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/peer_scorer_banman_integration_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ peer_scorer_banman_integration_tests built successfully$(COLOR_RESET)"
+
+header_proof_checker_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/header_proof_checker_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ header_proof_checker_tests built successfully$(COLOR_RESET)"
+
+# Phase 5 PR5.1: trivial-getter tests for ChainSelectorAdapter. Real
+# algorithm tests land in PR5.3 (chain_selector_tests will grow to ~14).
+chain_selector_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/chain_selector_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ chain_selector_tests built successfully$(COLOR_RESET)"
+
+# v4.1 mandatory upgrade — checkpoint enforcement tests (Phase 1 + Phase 2
+# startup validator + lifetime-miner snapshot assertion semantics).
+v4_1_checkpoint_enforcement_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/v4_1_checkpoint_enforcement_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ v4_1_checkpoint_enforcement_tests built successfully$(COLOR_RESET)"
+
+# v4.1 IBD silent-drop suppression tests. Note: v4.3 keeps the construction
+# gate on DILITHION_USE_NEW_CHAIN_SELECTOR but Phase 11 ABI fixes the
+# underlying AddBlockIndex flag-merge semantics. Suppression tests still
+# pass because the env-var gate behavior is unchanged.
+v4_1_chain_selector_suppression_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/v4_1_chain_selector_suppression_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ v4_1_chain_selector_suppression_tests built successfully$(COLOR_RESET)"
+
+# Phase 11 ABI: AddBlockIndex flag-merge tests. Verifies BLOCK_VALID_HEADER +
+# BLOCK_HAVE_DATA merge into the existing CBlockIndex when the same hash is
+# added twice — fixes the underlying cause of the v4.1 IBD silent-drop.
+add_block_index_flag_merge_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/add_block_index_flag_merge_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ add_block_index_flag_merge_tests built successfully$(COLOR_RESET)"
+
+# Phase 7 PR7.2: fork-staging legacy-path regression tests (state-machine
+# level; PreValidateBlock + TriggerChainSwitch + ProcessNewBlock end-to-end
+# deferred to Phase 8). 4 cases (3 required + 1 optional).
+fork_staging_legacy_path_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/fork_staging_legacy_path_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ fork_staging_legacy_path_tests built successfully$(COLOR_RESET)"
+
+# Phase 11 A1: port-path fork-staging dispatch tests. Locks the routing logic
+# in ChainSelectorAdapter::ProcessNewBlock that re-implements the legacy
+# block_processing.cpp staging behavior on the port path. 5 cases.
+port_fork_staging_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/port_fork_staging_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ port_fork_staging_tests built successfully$(COLOR_RESET)"
+
+# Phase 10 PR10.1: per-RPC unit tests for Phase 9 telemetry surface.
+# 9 cases locking v0.1.2 schemas of getsyncstatus + getblockdownloadstats
+# + getpeerinfo manager_class extension. Closes Cursor Phase 9 S4 + Layer-2
+# PR9.6-RT-MEDIUM-2 enhancement filings.
+phase_9_telemetry_rpc_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/phase_9_telemetry_rpc_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ phase_9_telemetry_rpc_tests built successfully$(COLOR_RESET)"
+
+# v4.3.4 Option C cut Block 3: regression gate proving legacy block-arrival
+# reaches chain selector with DILITHION_USE_NEW_CHAIN_SELECTOR=1 and NO
+# port peer manager registration.
+legacy_block_arrival_chainsel_gate_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/legacy_block_arrival_chainsel_gate_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ legacy_block_arrival_chainsel_gate_tests built successfully$(COLOR_RESET)"
+
+# Phase 6 PR6.1: HeadersManager → chain_selector wiring tests (5 cases).
+# Verifies happy-path, idempotency, orphan, rejected-parent flood,
+# cap-saturation per v1.5 plan §4 PR6.1.
+headers_manager_to_chain_selector_wiring_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/headers_manager_to_chain_selector_wiring_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ headers_manager_to_chain_selector_wiring_tests built successfully$(COLOR_RESET)"
+
+# Phase 6 PR6.4: FAST PATH 2 boundary tests (5 cases). Gates Patch H deletion.
+# Tests the specific defect class that caused PR5.6's revert.
+fast_path_2_boundary_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/fast_path_2_boundary_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ fast_path_2_boundary_tests built successfully$(COLOR_RESET)"
+
+# Phase 5 PR5.2.A: GetChainTips equivalence proof (legacy string-status
+# vs adapter enum-Status). Gates PR5.2.B CChainTipsTracker retirement.
+getchaintips_equivalence_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/getchaintips_equivalence_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ getchaintips_equivalence_tests built successfully$(COLOR_RESET)"
+
+# Phase 5 Day 4: Patch B equivalence harness. CONSENSUS-CRITICAL —
+# proves new chain-selection path produces same end-state as legacy
+# Case 2.5 + Patch B for all 5 scenarios. Gates PR5.4 (Patch B deletion).
+chain_case_2_5_equivalence_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/chain_case_2_5_equivalence_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ chain_case_2_5_equivalence_tests built successfully$(COLOR_RESET)"
+
+# Phase 5 Day 4 V1: chain_work bit-equivalence smoke test.
+chain_work_smoke_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/chain_work_smoke_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ chain_work_smoke_tests built successfully$(COLOR_RESET)"
+
+# v4.3.2 M1 fix: regression suite for LDN canary 2026-05-04. Verifies the
+# auto_rebuild marker is reliably written under both --usenewpeerman=0 and
+# --usenewpeerman=1 sync-coordinator configurations. See
+# src/test/auto_rebuild_marker_mode_symmetry_tests.cpp for full context.
+auto_rebuild_marker_mode_symmetry_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/auto_rebuild_marker_mode_symmetry_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ auto_rebuild_marker_mode_symmetry_tests built successfully$(COLOR_RESET)"
+
+# v4.3.3 T1: synthetic regression harness for canary-3 reproduction +
+# F1-F6 invariants in port-path chain selection. See
+# src/test/port_chain_selector_invariants_tests.cpp for full context.
+port_chain_selector_invariants_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/port_chain_selector_invariants_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ port_chain_selector_invariants_tests built successfully$(COLOR_RESET)"
+
+# v4.3.3 T2: differential testing harness — legacy vs port path equivalence
+# enforcement (audit modality 3 from feedback_audit_techniques_beyond_code_review).
+# Permanent CI infrastructure: every future port change that introduces an
+# unexpected divergence between legacy and port paths fails this suite.
+legacy_vs_port_differential_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/legacy_vs_port_differential_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ legacy_vs_port_differential_tests built successfully$(COLOR_RESET)"
+
+# Phase 5 Day 4 V1: deterministic WAL transition trace test (plan §13 hard gate #3).
+reorg_wal_crash_injection_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/reorg_wal_crash_injection_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ reorg_wal_crash_injection_tests built successfully$(COLOR_RESET)"
+
+# Phase 5 Day 4 V1: competing-sibling-below-checkpoint structural coverage.
+# WITH-Patch-H subset — gates PR5.6 (Patch H deletion).
+competing_sibling_below_checkpoint_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/competing_sibling_below_checkpoint_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ competing_sibling_below_checkpoint_tests built successfully$(COLOR_RESET)"
+
+# Phase 5 Day 5: regtest mode scaffold smoke test.
+regtest_chainparams_smoke: $(CORE_OBJECTS) $(OBJ_DIR)/test/regtest_chainparams_smoke.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ regtest_chainparams_smoke built successfully$(COLOR_RESET)"
+
 dna_serialization_test: $(CORE_OBJECTS) $(OBJ_DIR)/digital_dna/dna_serialization_test.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
@@ -615,6 +812,13 @@ vdf_lottery_test: $(CORE_OBJECTS) $(OBJ_DIR)/vdf/vdf_lottery_test.o $(DILITHIUM_
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 	@echo "$(COLOR_GREEN)✓ vdf_lottery_test built successfully$(COLOR_RESET)"
 
+# v4.2.0 — Time-decay cooldown unit tests. Standalone (only depends on
+# cooldown_tracker.cpp + std). See spec §7.1.
+v4_2_time_decay_cooldown_tests: $(OBJ_DIR)/test/v4_2_time_decay_cooldown_tests.o $(OBJ_DIR)/vdf/cooldown_tracker.o
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
+	@echo "$(COLOR_GREEN)✓ v4_2_time_decay_cooldown_tests built successfully$(COLOR_RESET)"
+
 test_passphrase_validator: $(OBJ_DIR)/wallet/passphrase_validator.o $(OBJ_DIR)/test_passphrase_validator.o
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
@@ -622,6 +826,18 @@ test_passphrase_validator: $(OBJ_DIR)/wallet/passphrase_validator.o $(OBJ_DIR)/t
 validate_crypto: validate_crypto.o $(OBJ_DIR)/crypto/hmac_sha3.o $(OBJ_DIR)/crypto/pbkdf2_sha3.o $(OBJ_DIR)/crypto/sha3.o $(DILITHIUM_OBJECTS)
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+
+# Phase 8 PR8.2: 4-node regtest harness (orchestration via bash script).
+# Boots 4 dilv-node regtest binaries in full-mesh topology, mines on Node A,
+# verifies lockstep + tip-hash equality + active-tip agreement + forbidden-
+# token GREP regression. Scenarios 2 (delay injection) + 3 (competing
+# leaves) deferred to PR8.2-followup (require Linux tc / dual-mining
+# infrastructure). Depends on dilv-node binary already built.
+.PHONY: four_node_test
+four_node_test:
+	@echo "$(COLOR_BLUE)[TEST]$(COLOR_RESET) 4-node regtest harness (scripts/four_node_local.sh)"
+	@bash scripts/four_node_local.sh smoke 10 180
+	@echo "$(COLOR_GREEN)✓ four_node_test passed$(COLOR_RESET)"
 
 # ============================================================================
 # Boost Unit Test Binaries
@@ -758,6 +974,7 @@ test: tests test_dilithion asert_test
 # Create build directories
 $(OBJ_DIR)/attestation \
 $(OBJ_DIR)/consensus \
+$(OBJ_DIR)/consensus/port \
 $(OBJ_DIR)/core \
 $(OBJ_DIR)/crypto \
 $(OBJ_DIR)/db \
@@ -766,6 +983,7 @@ $(OBJ_DIR)/index \
 $(OBJ_DIR)/kernel \
 $(OBJ_DIR)/miner \
 $(OBJ_DIR)/net \
+$(OBJ_DIR)/net/port \
 $(OBJ_DIR)/node \
 $(OBJ_DIR)/primitives \
 $(OBJ_DIR)/rpc \
@@ -785,7 +1003,7 @@ $(OBJ_DIR)/test/fuzz:
 	@mkdir -p $@
 
 # Compile C++ source files
-$(OBJ_DIR)/%.o: src/%.cpp | $(OBJ_DIR)/attestation $(OBJ_DIR)/consensus $(OBJ_DIR)/core $(OBJ_DIR)/crypto $(OBJ_DIR)/db $(OBJ_DIR)/dfmp $(OBJ_DIR)/index $(OBJ_DIR)/kernel $(OBJ_DIR)/miner $(OBJ_DIR)/net $(OBJ_DIR)/node $(OBJ_DIR)/primitives $(OBJ_DIR)/rpc $(OBJ_DIR)/wallet $(OBJ_DIR)/util $(OBJ_DIR)/api $(OBJ_DIR)/vdf $(OBJ_DIR)/digital_dna $(OBJ_DIR)/script $(OBJ_DIR)/policy $(OBJ_DIR)/tools $(OBJ_DIR)/x402 $(OBJ_DIR)/zmq $(OBJ_DIR)/test
+$(OBJ_DIR)/%.o: src/%.cpp | $(OBJ_DIR)/attestation $(OBJ_DIR)/consensus $(OBJ_DIR)/consensus/port $(OBJ_DIR)/core $(OBJ_DIR)/crypto $(OBJ_DIR)/db $(OBJ_DIR)/dfmp $(OBJ_DIR)/index $(OBJ_DIR)/kernel $(OBJ_DIR)/miner $(OBJ_DIR)/net $(OBJ_DIR)/net/port $(OBJ_DIR)/node $(OBJ_DIR)/primitives $(OBJ_DIR)/rpc $(OBJ_DIR)/wallet $(OBJ_DIR)/util $(OBJ_DIR)/api $(OBJ_DIR)/vdf $(OBJ_DIR)/digital_dna $(OBJ_DIR)/script $(OBJ_DIR)/policy $(OBJ_DIR)/tools $(OBJ_DIR)/x402 $(OBJ_DIR)/zmq $(OBJ_DIR)/test
 	@echo "$(COLOR_BLUE)[CXX]$(COLOR_RESET)  $<"
 	@$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
 
@@ -828,8 +1046,8 @@ depends:
 	@echo "$(COLOR_YELLOW)Building dependencies...$(COLOR_RESET)"
 	@echo "$(COLOR_BLUE)[RandomX]$(COLOR_RESET) Building RandomX library..."
 	@cd depends/randomx && mkdir -p build-windows && cd build-windows && cmake -DCMAKE_SYSTEM_PROCESSOR=x86_64 -G "MSYS Makefiles" .. && make
-	@echo "$(COLOR_BLUE)[Dilithium]$(COLOR_RESET) Building Dilithium library..."
-	@cd depends/dilithium/ref && make
+	@echo "$(COLOR_BLUE)[Dilithium]$(COLOR_RESET) Building Dilithium reference C objects..."
+	@$(MAKE) --no-print-directory $(DILITHIUM_OBJECTS)
 	@echo "$(COLOR_BLUE)[libzmq]$(COLOR_RESET) Building libzmq static library..."
 	@$(MAKE) --no-print-directory libzmq
 	@echo "$(COLOR_GREEN)Dependencies built$(COLOR_RESET)"

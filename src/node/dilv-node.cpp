@@ -19,6 +19,13 @@
 #include <malloc.h>  // malloc_trim()
 #endif
 
+// v4.1-rc2 ISSUE-2 fix: isatty() check for non-interactive stdin detection
+#ifdef _WIN32
+#include <io.h>      // _isatty / _fileno
+#else
+#include <unistd.h>  // isatty / fileno
+#endif
+
 #include <node/blockchain_storage.h>
 #include <node/block_processing.h>
 #include <node/mempool.h>
@@ -53,6 +60,7 @@
 #include <vdf/cooldown_tracker.h>
 #include <node/peer_mik_tracker.h>
 #include <node/registration_manager.h>  // v4.0.18: first-time registration state machine
+#include <node/startup_checkpoint_validator.h>  // v4.1: mandatory upgrade Phase 1 + Phase 2
 #include <consensus/vdf_validation.h>
 #include <wallet/wallet.h>
 #include <wallet/passphrase_validator.h>
@@ -80,8 +88,11 @@
 #include <policy/fees.h>               // PR-EF-2: CBlockPolicyEstimator + g_fee_estimator
 #include <policy/fee_persist.h>        // PR-EF-2: fee_estimates.dat (DumpFeeEstimates / LoadFeeEstimates)
 #include <consensus/validation.h>      // PR-EF-2: DeserializeBlockTransactions for the connect callback
-// DilV: No RandomX -- VDF-only chain
-// #include <crypto/randomx_hash.h>
+// DilV: No RandomX -- VDF-only chain in production.
+// Phase 5 regtest: validation-mode RandomX init (see ChainParams::Regtest()
+// rationale in chainparams.cpp). Production DilV doesn't link RandomX in;
+// regtest path explicitly does.
+#include <crypto/randomx_hash.h>
 #include <util/logging.h>  // Bitcoin Core-style logging
 #include <util/stacktrace.h>  // Phase 2.2: Crash diagnostics
 #include <util/pidfile.h>  // STRESS TEST FIX: Stale lock detection
@@ -260,6 +271,7 @@ extern CChainState g_chainstate;
 // Phase 1.2: NodeContext for centralized global state management (Bitcoin Core pattern)
 #include <core/node_context.h>
 #include <node/ibd_coordinator.h>  // Phase 5.1: IBD Coordinator
+#include <net/port/sync_coordinator_adapter.h>  // Phase 6 PR6.5a: adapter
 extern NodeContext g_node_context;
 
 // Phase 5: Helper function to connect to a peer (for outbound connections)
@@ -298,6 +310,7 @@ extern NodeState g_node_state;
 // Phase 1.2: NodeContext for centralized global state management (Bitcoin Core pattern)
 #include <core/node_context.h>
 #include <node/ibd_coordinator.h>  // Phase 5.1: IBD Coordinator
+#include <net/port/sync_coordinator_adapter.h>  // Phase 6 PR6.5a: adapter
 extern NodeContext g_node_context;
 
 // Global flag for UTXO sync optimization (defined in utxo_set.cpp)
@@ -515,6 +528,7 @@ void SignalHandler(int signal) {
 struct NodeConfig {
     // DilV: No testnet flag — DilV is its own standalone network
     bool testnet = false;  // Always false for DilV (kept for compatibility with shared code)
+    bool regtest = false;  // Phase 5: regression-test mode for V2 byte-equivalence
     std::string datadir = "";       // Will be set to ~/.dilv
     uint16_t rpcport = 0;           // Will be set to 9332
     uint16_t p2pport = 0;           // Will be set to 9444
@@ -543,6 +557,9 @@ struct NodeConfig {
     int max_connections = 0;         // --maxconnections: Maximum peer connections (0 = default 125)
     int max_connections_per_ip = 2;  // --max-connections-per-ip: Max inbound per IP (default 2, range 1-64)
     int attestation_rate_limit = 1;  // --attestation-rate-limit: Max attestations per /24 subnet per day (Sybil defense)
+    // use_new_peerman field removed in v4.3.4 cut Block 8 with the --usenewpeerman
+    // flag retirement (port::CPeerManager class deleted in Block 7; flag was a no-op
+    // since Block 7).
 
     bool ParseArgs(int argc, char* argv[]) {
         for (int i = 1; i < argc; ++i) {
@@ -551,6 +568,9 @@ struct NodeConfig {
             if (arg == "--testnet") {
                 std::cerr << "Error: DilV node does not support --testnet (DilV is its own network)" << std::endl;
                 return false;
+            }
+            else if (arg == "--regtest") {
+                regtest = true;
             }
             else if (arg.find("--datadir=") == 0) {
                 datadir = arg.substr(10);
@@ -769,7 +789,7 @@ struct NodeConfig {
             else if (arg.find("--attestation-rate-limit=") == 0) {
                 // Max MIK attestations per /24 subnet per day (Sybil defense)
                 try {
-                    int val = std::stoi(arg.substr(24));
+                    int val = std::stoi(arg.substr(25));
                     if (val < 1 || val > 100) {
                         std::cerr << "Error: Invalid attestation-rate-limit (must be 1-100): " << arg << std::endl;
                         return false;
@@ -780,6 +800,8 @@ struct NodeConfig {
                     return false;
                 }
             }
+            // --usenewpeerman flag arms removed in v4.3.4 cut Block 8.
+            // See dilithion-node.cpp for full context.
             else if (arg == "--help" || arg == "-h") {
                 return false;
             }
@@ -2021,9 +2043,14 @@ int main(int argc, char* argv[]) {
     std::cout << "======================================" << std::endl;
     std::cout << std::endl;
 
-    // Initialize chain parameters — always DilV
-    Dilithion::g_chainParams = new Dilithion::ChainParams(Dilithion::ChainParams::DilV());
-    std::cout << "Network: DILV (VDF distribution, ~45s blocks)" << std::endl;
+    // Initialize chain parameters — DilV by default, regtest when --regtest is set
+    if (config.regtest) {
+        Dilithion::g_chainParams = new Dilithion::ChainParams(Dilithion::ChainParams::Regtest());
+        std::cout << "Network: REGTEST (Phase 5 byte-equivalence integration testing)" << std::endl;
+    } else {
+        Dilithion::g_chainParams = new Dilithion::ChainParams(Dilithion::ChainParams::DilV());
+        std::cout << "Network: DILV (VDF distribution, ~45s blocks)" << std::endl;
+    }
 
     // Phase 10: Set default datadir, ports from chain params if not specified
     // (Config file values already applied above, now apply chain params as final fallback)
@@ -2325,8 +2352,24 @@ int main(int argc, char* argv[]) {
         std::cout << "  [OK] Chain state initialized" << std::endl;
 
         // DilV: No RandomX initialization — VDF-only chain
-        // Block hashing uses SHA3 (FastHash), no RandomX needed
-        std::cout << "  [OK] DilV uses VDF consensus (no RandomX initialization needed)" << std::endl;
+        // Block hashing uses SHA3 (FastHash), no RandomX needed.
+        //
+        // EXCEPTION: regtest mode (Phase 5 V2 byte-equivalence testing).
+        // HeadersManager's validation worker thread starts up unconditionally
+        // via NodeContext::Init and expects RandomX VM to be initialized
+        // when it runs. For production DilV the path that triggers this is
+        // never reached (existing testnet datadirs were created before the
+        // VDF-genesis switch and skip relevant codepaths). For a FRESH
+        // regtest datadir we hit it. Initialize LIGHT validation mode so
+        // the worker thread can spawn cleanly. Adds ~1-2s startup time.
+        if (config.regtest) {
+            std::cout << "  Initializing RandomX LIGHT validation mode (regtest)..." << std::endl;
+            const char* rx_key = "Dilithion-RandomX-v1";
+            randomx_init_validation_mode(rx_key, strlen(rx_key));
+            std::cout << "  [OK] RandomX validation mode ready" << std::endl;
+        } else {
+            std::cout << "  [OK] DilV uses VDF consensus (no RandomX initialization needed)" << std::endl;
+        }
 
         // Load and verify genesis block
 load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
@@ -2500,8 +2543,24 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                     return 1;
                 }
                 g_chainstate.SetTip(pgenesisIndexPtr);
+                // v4.3.1: seed candidate set after tip established. Without
+                // this, m_setBlockIndexCandidates stays empty after disk load
+                // — under env-var=1 path, FindMostWorkChainImpl returns
+                // whichever single block was last inserted, never comparing
+                // against tip's chainwork. Caused LDN tip-going-backwards /
+                // dual-hash deadlock 2026-05-04.
+                g_chainstate.RecomputeCandidates();
                 std::cout << " ✓" << std::endl;
                 std::cout << "  [OK] Loaded chain state: 1 block (height 0)" << std::endl;
+
+                // v4.1 Phase 1 startup checkpoint validation — Site A
+                // (genesis-only path). Essentially a no-op for fresh
+                // genesis (no checkpoints at heights ≤ 0) but runs for
+                // consistency with Site B. Cursor v0.3 F2 fix.
+                if (!Dilithion::ValidateChainAgainstCheckpoints(g_chainstate.GetTip())) {
+                    delete Dilithion::g_chainParams;
+                    return 1;
+                }
             } else if (!(hashBestBlock.IsNull())) {
                 std::cout << "  Best block hash: " << hashBestBlock.GetHex().substr(0, 16) << "..." << std::endl;
 
@@ -2658,6 +2717,13 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                 }
 
                 g_chainstate.SetTip(pindexTip);
+                // v4.3.1: seed candidate set after tip established. Without
+                // this, m_setBlockIndexCandidates stays empty after disk load
+                // — under env-var=1 path, FindMostWorkChainImpl returns
+                // whichever single block was last inserted, never comparing
+                // against tip's chainwork. Caused LDN tip-going-backwards /
+                // dual-hash deadlock 2026-05-04.
+                g_chainstate.RecomputeCandidates();
                 g_chain_height.store(static_cast<unsigned int>(pindexTip->nHeight));  // BUG #108 FIX: Set global height for TX validation
 
                 // BUG #270 FIX: Ensure all blocks on the active chain have BLOCK_VALID_CHAIN set.
@@ -2678,6 +2744,20 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                         std::cout << "  [FIX] Set BLOCK_VALID_CHAIN on " << fixed_count
                                   << " blocks in active chain (bootstrap fix)" << std::endl;
                     }
+                }
+
+                // v4.1 Phase 1 startup checkpoint validation — Site B
+                // (full-chain-load path). Runs AFTER the BLOCK_VALID_CHAIN
+                // repair walk completes (post-2685) and BEFORE the undo
+                // integrity probe (~2698). This ordering ensures:
+                //  - Repair walk completes first (cleaner post-repair state)
+                //  - Checkpoint mismatch error wins over generic undo error
+                //  - P2P init hasn't happened yet — no peer can observe a
+                //    known-bad tip
+                // Cursor v0.3 F3 placement.
+                if (!Dilithion::ValidateChainAgainstCheckpoints(g_chainstate.GetTip())) {
+                    delete Dilithion::g_chainParams;
+                    return 1;
                 }
 
                 // v4.0.19 Fix B: Startup undo-presence integrity check.
@@ -3015,6 +3095,15 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                           << load_result.error_message
                           << " -- continuing with empty mempool" << std::endl;
             }
+        }
+
+        // Phase 11 A1: now that blockchain_db is wired, enable fork-staging
+        // dispatch on the port chain selector adapter. See dilithion-node.cpp
+        // for full rationale. Post v4.3.4 cut: the port::CPeerManager bypass
+        // concern is moot (class deleted, flag retired) — only the legacy
+        // block-arrival path reaches ProcessNewBlock now.
+        if (!g_node_context.WireForkStaging()) {
+            std::cerr << "[startup] WARN: WireForkStaging failed — port path will not stage forks" << std::endl;
         }
 
         // Keep legacy globals for backward compatibility during migration
@@ -3363,7 +3452,7 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         // Phase 1.2: Store in NodeContext (Bitcoin Core pattern)
         g_node_context.connman = std::move(connman);
         g_node_context.message_processor = &message_processor;
-        
+
         // Phase 5: Create and start async broadcaster for non-blocking message broadcasting
         // Now uses CConnman instead of CConnectionManager
         CAsyncBroadcaster async_broadcaster(g_node_context.connman.get());
@@ -3596,6 +3685,10 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
             if (g_node_context.block_fetcher) {
                 g_node_context.block_fetcher->OnPeerConnected(peer_id);
             }
+            // v4.3.4 cut Block 5 (errata E2): verack-path dynamic_cast +
+            // OnPeerConnected dispatch to port::CPeerManager removed. Block 4
+            // already deleted the port-side per-peer state that this hook
+            // initialized. Block 7 retires the class entirely.
 
             // Phase C FIX: Notify CPeerManager of handshake completion
             // This is CRITICAL for IsPeerSuitableForDownload() to return true
@@ -4595,9 +4688,16 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         // v4.0.22 Patch E: time-based cooldown expiry retirement height
         int time_based_expiry_retired = Dilithion::g_chainParams ?
             Dilithion::g_chainParams->timeBasedCooldownExpiryRetiredHeight : 999999999;
+        // v4.2.0: time-decay cooldown activation + decay rate
+        int time_decay_activation = Dilithion::g_chainParams ?
+            Dilithion::g_chainParams->timeDecayCooldownActivationHeight : 999999999;
+        int time_decay_seconds = Dilithion::g_chainParams ?
+            Dilithion::g_chainParams->cooldownTimeDecaySeconds : 60;
         CCooldownTracker cooldown_tracker(vdf_cooldown_window, vdf_cooldown_short,
                                           stabilization_height, target_block_time,
-                                          time_based_expiry_retired);
+                                          time_based_expiry_retired,
+                                          time_decay_activation,
+                                          time_decay_seconds);
         g_node_context.cooldown_tracker = &cooldown_tracker;
 
         // Sybil defense Phase 1: Block relay source tracker
@@ -4719,7 +4819,21 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
 
             int assumeValidH = Dilithion::g_chainParams ? Dilithion::g_chainParams->dfmpAssumeValidHeight : 0;
             // Skip revalidation if chain is below assume-valid height (blocks already accepted by network)
-            if (chainHeight > activationHeight && activationHeight < 999999999 && chainHeight > assumeValidH) {
+            //
+            // v4.1.1 hotfix: also skip if activationHeight == 0 ("active from
+            // genesis" — DilV mainnet chainparams sets all three thresholds to 0).
+            // The revalidation block was designed for testnet where VDF activates
+            // at a specific height > 0; it walks back to find blocks "before
+            // activation" so the cooldown tracker has prior context. With
+            // activation=0 there is no "before genesis" to walk to, so the tracker
+            // is Cleared but never repopulated, leaving it empty. v4.1's HIGH-2
+            // startup validator then sees count=0 vs expected=65 and refuses to
+            // run. Discovered when SYD's first stable-binary restart found the
+            // chain had advanced from 44233 to 44234 (some miner produced a
+            // valid post-fork block) — the revalidation triggered for the first
+            // time and hit this latent bug. Fix: skip revalidation entirely when
+            // activationHeight == 0 since it has nothing to revalidate against.
+            if (chainHeight > activationHeight && activationHeight > 0 && activationHeight < 999999999 && chainHeight > assumeValidH) {
                 std::cout << "\n[REVALIDATION] Scanning blocks " << activationHeight
                           << " to " << chainHeight << " for consensus rule compliance..." << std::endl;
 
@@ -4882,6 +4996,25 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
             }
         }
 
+        // v4.1 Phase 2 startup validation — lifetime-miner snapshot assertion.
+        // Runs AFTER the optional revalidation block above (which may
+        // Clear() and replay the cooldown tracker). Asserts the tracker's
+        // computed distinct-miner count at h=44232 matches the canonical
+        // embedded snapshot. Closes Layer-2 v0.1 CRIT-1 (non-deterministic
+        // pre-44233 history ingestion). Wiring point per Cursor v0.3 F3 +
+        // Layer-2 v0.2 NEW-1 (v0.4 wired here at ~4737, post-revalidation;
+        // v0.3 had wired at ~4531 BEFORE the tracker was even constructed
+        // — that was dead code on every startup).
+        //
+        // Skipped on placeholder builds (lifetimeMinerCountAt44232 = 0)
+        // and below activation height. Exit code 3 distinguishes from
+        // Phase 1 checkpoint mismatch (exit 1) and undo integrity (exit 2).
+        if (!Dilithion::ValidateLifetimeMinerSnapshot(g_chainstate.GetTip(),
+                                                       g_node_context.cooldown_tracker)) {
+            delete Dilithion::g_chainParams;
+            return 3;
+        }
+
         // Phase 4: Initialize wallet (before mining callback setup)
         // BUG #56 FIX: Full wallet persistence with Bitcoin Core pattern
         CWallet wallet;
@@ -4973,11 +5106,69 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                     std::cerr << "  Please check that your recovery phrase is correct" << std::endl;
                     return 1;
                 }
+            } else if (config.regtest) {
+                // Phase 10 PR10.5b: regtest auto-create wallet path. Regtest is
+                // a deterministic lab environment — no operator at the keyboard
+                // to answer the interactive prompt. Auto-create a fresh HD
+                // wallet with a generated mnemonic (deterministic per-run; the
+                // wallet is throwaway anyway since regtest datadirs are wiped
+                // between runs). Skips the interactive prompt at line 4824
+                // which would loop forever on EOF in a backgrounded harness.
+                //
+                // Production behavior unchanged: this branch fires ONLY when
+                // config.regtest is true. Mainnet/testnet still hit the
+                // interactive prompt below.
+                std::cout << "  Regtest auto-create: generating fresh HD wallet..." << std::endl;
+                std::string generated_mnemonic;
+                if (wallet.GenerateHDWallet(generated_mnemonic, "")) {
+                    std::cout << "  [OK] Regtest wallet created successfully." << std::endl;
+                    CDilithiumAddress addr = wallet.GetNewHDAddress();
+                    std::cout << "  First address: " << addr.ToString() << std::endl;
+                    // PR10.5b-RT-LOW-1 hardening: explicitly cleanse the
+                    // generated mnemonic from local scope (matches the
+                    // production-path discipline used elsewhere in this
+                    // file). Removes the load-bearing "regtest is throwaway"
+                    // comment so a future developer copy-pasting this branch
+                    // for testnet/mainnet doesn't silently inherit a
+                    // memory-cleanse gap.
+                    if (!generated_mnemonic.empty()) {
+                        memory_cleanse(&generated_mnemonic[0], generated_mnemonic.size());
+                    }
+                } else {
+                    std::cerr << "  ERROR: Regtest auto-create wallet failed" << std::endl;
+                    return 1;
+                }
             } else {
             // Interactive prompt: Create new or restore?
             // NOTE: Network threads may already be running, but we need user input here
             // Clear any buffered input before prompting
             std::cin.clear();
+
+            // v4.1-rc2 ISSUE-2 fix: detect non-interactive stdin and exit cleanly
+            // instead of looping forever printing "Invalid choice" on empty reads.
+            // Common cause: nohup, systemd, or other non-TTY launches without
+            // --relay-only. Without this guard, a user's log can grow to GB-scale
+            // within minutes (we observed 2.2 GB in ~10 min during v4.1-rc1 testing).
+#ifdef _WIN32
+            const bool stdin_is_tty = (_isatty(_fileno(stdin)) != 0);
+#else
+            const bool stdin_is_tty = (isatty(fileno(stdin)) != 0);
+#endif
+            if (!stdin_is_tty) {
+                std::cerr << std::endl
+                          << "ERROR: Wallet setup requires an interactive terminal." << std::endl
+                          << "stdin is not a TTY — cannot prompt for wallet creation." << std::endl
+                          << std::endl
+                          << "Options:" << std::endl
+                          << "  1. For seed/relay-only operation:" << std::endl
+                          << "       Add --relay-only to skip wallet creation entirely." << std::endl
+                          << "  2. For mining:" << std::endl
+                          << "       Run interactively (in a terminal) once to create" << std::endl
+                          << "       the wallet, then move to non-interactive operation" << std::endl
+                          << "       (nohup, systemd, etc.)." << std::endl
+                          << std::endl;
+                return 1;
+            }
 
             std::cout << std::endl;
             std::cout << "+==============================================================================+" << std::endl;
@@ -4995,6 +5186,14 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                 std::cout << "Enter choice (1 or 2): ";
                 std::cout.flush();
                 std::getline(std::cin, wallet_choice);
+
+                // v4.1-rc2 ISSUE-2 defense-in-depth: if stdin closes mid-prompt
+                // (TTY check passed but EOF/fail now), exit instead of looping.
+                if (std::cin.eof() || std::cin.fail()) {
+                    std::cerr << std::endl
+                              << "ERROR: stdin closed during wallet setup. Aborting." << std::endl;
+                    return 1;
+                }
 
                 // Trim whitespace
                 size_t start = wallet_choice.find_first_not_of(" \t\r\n");
@@ -5810,7 +6009,9 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
             // Create block index
             auto pblockIndex = std::make_unique<CBlockIndex>(block);
             pblockIndex->phashBlock = blockHash;
-            pblockIndex->nStatus = CBlockIndex::BLOCK_HAVE_DATA;
+            // v4.3.3 F14: canonical block-receipt flag-setter for the DilV
+            // VDF local-mining path (F1 + F7 combined).
+            pblockIndex->MarkBlockReceived();
             pblockIndex->pprev = g_chainstate.GetBlockIndex(block.hashPrevBlock);
             if (!pblockIndex->pprev) {
                 std::cerr << "[VDF] ERROR: Cannot find parent block" << std::endl;
@@ -5920,8 +6121,8 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                     // v4.0.17: print BLOCK NOT SELECTED immediately for the
                     // submit-time loss case. We KNOW right now we lost (our
                     // block did not become tip), so deferring would just hide
-                    // the outcome behind the next round's BLOCK PRODUCED
-                    // message. The height label distinguishes this from any
+                    // the outcome behind the next round's BLOCK CANDIDATE
+                    // PRODUCED message. The height label distinguishes this from any
                     // concurrently-firing deferred notification for an
                     // earlier round (rare: only if a previous block became
                     // tip and was reorged out of canonical chain later).
@@ -6482,13 +6683,23 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                 CRPCServer::NotifyBlockTipChanged();
             });
 
-        // Phase 2+3: Seed attestation initialization (relay-only DilV nodes only)
+        // Phase 2+3: Seed attestation initialization (ALL DilV mainnet seeds)
         // Loads ASN database and attestation signing key so seeds can serve
         // getmikattestation RPC requests from miners.
+        //
+        // v4.3 fix 2026-05-04: removed `config.relay_only` gate. NYC runs
+        // without --relay-only because it's the bridge host. Under the prior
+        // gate, NYC's seed_attestation_key.dat existed on disk but was never
+        // loaded — RegisterSeedAttestation() never called — making NYC
+        // unable to serve getmikattestation RPCs ("is only available on seed
+        // nodes" error). Network attestation capacity dropped from 4-of-4
+        // baked-in seed pubkeys to 3-of-4 functional. Fix: gate attestation
+        // init only on IsDilV() (the chain semantic), not on a CLI flag
+        // unrelated to attestation. Bridge ops are unaffected because
+        // attestation init only registers an RPC handler + loads keys.
         static Attestation::CSeedAttestationKey seedAttestKey;
         static CASNDatabase asnDatabase;
-        if (config.relay_only && Dilithion::g_chainParams &&
-            Dilithion::g_chainParams->IsDilV()) {
+        if (Dilithion::g_chainParams && Dilithion::g_chainParams->IsDilV()) {
             std::string dataDir = Dilithion::g_chainParams->dataDir;
 
             // Load ASN database from data directory (or project root)
@@ -6701,10 +6912,66 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                 std::cout << "  [AUTH] RPC authentication enabled" << std::endl;
             }
         } else if (config.public_api) {
-            // Public API mode binds to all interfaces — REFUSE to run without auth
-            std::cerr << "ERROR: --public-api requires RPC authentication. "
-                      << "Set rpcuser and rpcpassword in your config file." << std::endl;
-            return 1;
+            // v4.1-rc2 ISSUE-1 fix: auto-generate secure random RPC credentials
+            // for --public-api when none configured, instead of refusing to start.
+            // The auto-generated dilithion.conf created by the binary on first
+            // startup is empty, so a fresh seed/server with --public-api would
+            // crash with "ERROR: --public-api requires RPC authentication" and
+            // call terminate() — terrible UX. Now we generate random creds
+            // (32-byte hex password), persist them to <datadir>/dilithion.conf
+            // mode 0600, and use them. Operator can edit the config later to
+            // change them.
+            // FINDING-1 (red-team rc2 review): GenerateSalt() resizes to
+            // WALLET_CRYPTO_SALT_SIZE=16, only filling 16 bytes (128 bits).
+            // Use GetStrongRandBytes directly for the full 32 bytes (256 bits)
+            // promised in the comments.
+            extern bool GetStrongRandBytes(uint8_t* buf, size_t len);
+            std::vector<uint8_t> pw_bytes(32);
+            if (!GetStrongRandBytes(pw_bytes.data(), pw_bytes.size())) {
+                std::cerr << "ERROR: --public-api requires RPC authentication, and "
+                          << "auto-generation of random credentials failed.\n"
+                          << "Add these lines to " << config.datadir << "/dilithion.conf:\n"
+                          << "  rpcuser=<choose any username>\n"
+                          << "  rpcpassword=<choose a strong password>\n"
+                          << "Then restart." << std::endl;
+                return 1;
+            }
+            std::string pw_hex;
+            pw_hex.reserve(64);
+            for (auto b : pw_bytes) {
+                char hex[3];
+                snprintf(hex, sizeof(hex), "%02x", b);
+                pw_hex += hex;
+            }
+            rpcuser = "dilithion";
+            rpcpassword = pw_hex;
+
+            // Append to dilithion.conf for persistence across restarts.
+            std::string conf_path = config.datadir + "/dilithion.conf";
+            std::ofstream conf_file(conf_path, std::ios::app);
+            if (conf_file.is_open()) {
+                conf_file << "\n# v4.1-rc2: auto-generated for --public-api\n";
+                conf_file << "rpcuser=" << rpcuser << "\n";
+                conf_file << "rpcpassword=" << rpcpassword << "\n";
+                conf_file.close();
+#ifndef _WIN32
+                chmod(conf_path.c_str(), 0600);
+#endif
+                std::cout << "  [AUTH] --public-api: auto-generated RPC credentials "
+                          << "written to " << conf_path << " (mode 0600)" << std::endl;
+                std::cout << "  [AUTH] rpcuser=" << rpcuser
+                          << " (rpcpassword in conf file)" << std::endl;
+            } else {
+                std::cerr << "WARNING: --public-api auto-credentials generated but failed to "
+                          << "persist to " << conf_path << ". They will work this session only "
+                          << "and won't survive restart." << std::endl;
+            }
+
+            if (!rpc_server.InitializePermissions(rpc_permissions_file, rpcuser, rpcpassword)) {
+                std::cerr << "ERROR: Failed to initialize RPC permissions with auto-generated credentials" << std::endl;
+                return 1;
+            }
+            std::cout << "  [AUTH] RPC authentication enabled (auto-generated)" << std::endl;
         } else {
             // No credentials configured — generate a cookie file for local auth.
             std::string cookie_path = config.datadir + "/.cookie";
@@ -6899,6 +7166,13 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         // Phase 5.1: Initialize IBD Coordinator (must be after all components are ready)
         CIbdCoordinator ibd_coordinator(g_chainstate, g_node_context);
         g_node_context.ibd_coordinator = &ibd_coordinator;  // Register for IsSynced() access
+
+        // v4.3.4 cut Block 7+8: sync_coordinator always backs onto legacy
+        // CIbdCoordinator via CIbdCoordinatorAdapter. port::CPeerManager
+        // class deleted (Block 7); --usenewpeerman flag retired (Block 8).
+        // Closes G08-G11.
+        g_node_context.sync_coordinator =
+            std::make_unique<dilithion::net::port::CIbdCoordinatorAdapter>(ibd_coordinator);
         LogPrintf(IBD, INFO, "IBD Coordinator initialized");
 
         // Solo mining prevention state - declared before new_block_found handler
@@ -6915,9 +7189,14 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         static uint256 last_checked_tip_hash;
         static int consecutive_self_mined = 0;
         static bool mining_paused_consensus_fork = false;
-        static bool solo_warning_shown = false;
-        static constexpr int SOLO_WARNING_THRESHOLD = 5;   // Warn after 5 consecutive self-mined blocks
-        static constexpr int SOLO_PAUSE_THRESHOLD = 10;    // Pause after 10 consecutive self-mined blocks
+        // v4.1: tightened from 10 to 2. With cooldown rule active
+        // (MIN_COOLDOWN=2 in cooldown_tracker.h), a single MIK CANNOT
+        // legitimately win 2 consecutive blocks on a healthy chain.
+        // 2-in-a-row indicates either consensus rule bypass or an
+        // isolated solo fork — pause and alert operator immediately.
+        // SOLO_WARNING_THRESHOLD removed entirely (warning at 1 would
+        // fire on every self-mined block; meaningless).
+        static constexpr int SOLO_PAUSE_THRESHOLD = 2;
 
         // Tip divergence detection state - compares our tip hash vs peers' tips
         // Catches the case where we have peers but are on a different chain
@@ -7074,7 +7353,7 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                             if (stuck_mins >= 10 && since_warning >= 5) {
                                 last_warning = now;
                                 int hdrHeight = g_node_context.headers_manager ? g_node_context.headers_manager->GetBestHeight() : -1;
-                                int syncPeer = g_node_context.ibd_coordinator ? g_node_context.ibd_coordinator->GetHeadersSyncPeer() : -1;
+                                int syncPeer = g_node_context.sync_coordinator ? g_node_context.sync_coordinator->GetHeadersSyncPeer() : -1;
                                 std::cout << "\n  [WARN] Node stuck at height 0 for " << stuck_mins << " minutes despite having peers." << std::endl;
                                 std::cout << "  [WARN] Headers height: " << hdrHeight << ", sync peer: " << syncPeer << std::endl;
                                 std::cout << "  [WARN] If headers=0, the seed may not be responding to GETHEADERS." << std::endl;
@@ -7102,9 +7381,34 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
             // ========================================
             // BLOCK DOWNLOAD COORDINATION (IBD)
             // ========================================
-            // Phase 5.1: Use IBD Coordinator instead of inline logic
-            // This encapsulates all IBD logic (backoff, queueing, fetching, retries)
-            ibd_coordinator.Tick();
+            // Phase 5.1: Use IBD Coordinator instead of inline logic.
+            // Phase 6 PR6.5a fix-up 2026-04-27: route Tick() through
+            // ISyncCoordinator. Post v4.3.4 cut, this always routes to
+            // CIbdCoordinator::Tick via CIbdCoordinatorAdapter (the
+            // alternate port::CPeerManager Tick was retired in Block 7).
+            if (g_node_context.sync_coordinator) {
+                g_node_context.sync_coordinator->Tick();
+            }
+
+            // v4.3.2 M1 fix: poll chainstate's UTXO/chain rebuild flags and
+            // surface auto_rebuild + shutdown if either fires. Lifted out of
+            // CIbdCoordinator::Tick to a free helper called from main loop.
+            // Original motivation: under the then-existing --usenewpeerman=1
+            // path, this Tick() was bypassed — LDN canary 2026-05-04 regressed
+            // 254 blocks because the in-Tick() recovery never ran. Post
+            // v4.3.4 cut, sync_coordinator always wraps CIbdCoordinator
+            // (Block 7 retired the alternate path), but the main-loop helper
+            // remains the cleanest single dispatch point.
+            //
+            // v4.3.2 M1 H1 (Layer-3 review 2026-05-04): pass config.datadir,
+            // NOT g_chainParams->dataDir. The chainparams field is set ONCE
+            // at construction (chainparams.cpp:429 GetDataDir(DILV)) and
+            // ignores --datadir=PATH. The startup marker detection at
+            // dilv-node.cpp:2180 reads config.datadir; if these diverge, the
+            // marker is written to a path the wrapper-restart never inspects
+            // and recovery is silently severed — exactly the LDN canary's
+            // failure shape, just triggered by a different precondition.
+            Dilithion::MaybeTriggerChainRebuild(g_chainstate, config.datadir, &g_node_state.running);
 
             // IBD DEBUG: Log that Tick() returned and main loop continues
             static int main_loop_count = 0;
@@ -7129,7 +7433,17 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                 size_t peer_count = g_node_context.peer_manager ? g_node_context.peer_manager->GetConnectionCount() : 0;
                 auto now = std::chrono::steady_clock::now();
 
-                if (peer_count == 0) {
+                // Regtest bypass: the no-peers grace period and the solo-fork
+                // detection are mainnet safety nets — regtest IS solo by design
+                // (single-miner harness), and the localhost full-mesh topology
+                // legitimately has flapping peers due to the "already have
+                // outbound connection" rejection on inbound. Both safety nets
+                // would false-positive in this environment. Gate both behind
+                // the regtest check so production behavior is unchanged.
+                const bool kIsRegtest =
+                    Dilithion::g_chainParams && Dilithion::g_chainParams->IsRegtest();
+
+                if (!kIsRegtest && peer_count == 0) {
                     // No peers - check if we need to start countdown or pause mining
                     if (no_peers_since == std::chrono::steady_clock::time_point{}) {
                         // Just lost peers - start the countdown
@@ -7265,7 +7579,11 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                                         float ratio = static_cast<float>(self_count) / static_cast<float>(recent_blocks.size());
                                         size_t peer_cnt = g_node_context.peer_manager ? g_node_context.peer_manager->GetConnectionCount() : 0;
 
-                                        if (ratio >= SOLO_PAUSE_RATIO && peer_cnt > 0
+                                        // Regtest bypass: single-miner harness will always show
+                                        // 100% self-mined ratio. Production safety net only.
+                                        const bool kIsRegtest_ratio =
+                                            Dilithion::g_chainParams && Dilithion::g_chainParams->IsRegtest();
+                                        if (!kIsRegtest_ratio && ratio >= SOLO_PAUSE_RATIO && peer_cnt > 0
                                             && !mining_paused_consensus_fork) {
                                             std::cout << std::endl;
                                             std::cout << "[Mining] WARNING: " << static_cast<int>(ratio * 100)
@@ -7275,8 +7593,9 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                                             std::cout << std::endl;
                                             if (vdf_miner.IsRunning()) vdf_miner.Stop();
                                             mining_paused_consensus_fork = true;
-                                        } else if (ratio >= SOLO_WARN_RATIO && peer_cnt > 0
-                                                   && !solo_warning_shown) {
+                                        } else if (!kIsRegtest_ratio && ratio >= SOLO_WARN_RATIO && peer_cnt > 0) {
+                                            // v4.1: removed `&& !solo_warning_shown` flag-suppression clause;
+                                            // solo_warning_shown removed entirely. Layer-2 v0.4 NEW-DEFECT-1.
                                             std::cout << "[Mining] WARNING: " << static_cast<int>(ratio * 100)
                                                       << "% of last " << recent_blocks.size()
                                                       << " blocks are self-mined" << std::endl;
@@ -7287,7 +7606,12 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                                         // Sequential counter (existing logic)
                                         consecutive_self_mined++;
 
-                                        if (consecutive_self_mined >= SOLO_PAUSE_THRESHOLD
+                                        // Regtest bypass: single-miner harness expected
+                                        // to chain consecutive self-mined blocks. Production
+                                        // safety net only.
+                                        const bool kIsRegtest_seq =
+                                            Dilithion::g_chainParams && Dilithion::g_chainParams->IsRegtest();
+                                        if (!kIsRegtest_seq && consecutive_self_mined >= SOLO_PAUSE_THRESHOLD
                                             && !mining_paused_consensus_fork) {
                                             // CRITICAL: Auto-pause mining
                                             std::cout << std::endl;
@@ -7304,24 +7628,22 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                                             std::cout << std::endl;
                                             if (vdf_miner.IsRunning()) vdf_miner.Stop();
                                             mining_paused_consensus_fork = true;
-                                        } else if (consecutive_self_mined >= SOLO_WARNING_THRESHOLD
-                                                   && !solo_warning_shown) {
-                                            // Warning: unusual solo mining pattern
-                                            std::cout << std::endl;
-                                            std::cout << "[Mining] WARNING: You have mined " << consecutive_self_mined
-                                                      << " consecutive blocks with no blocks from other miners" << std::endl;
-                                            std::cout << "[Mining] This is unusual and may indicate a consensus fork" << std::endl;
-                                            std::cout << "[Mining] Ensure you are running the latest version from dilithion.org" << std::endl;
-                                            std::cout << std::endl;
-                                            solo_warning_shown = true;
                                         }
+                                        // v4.1: SOLO_WARNING_THRESHOLD-based warning branch removed
+                                        // entirely. PAUSE at 2 leaves no room for an intermediate
+                                        // warning. Layer-2 v0.4 NEW-DEFECT-1.
                                     } else {
-                                        // Another miner's block - healthy network activity
-                                        if (consecutive_self_mined >= SOLO_WARNING_THRESHOLD) {
+                                        // Another miner's block - healthy network activity.
+                                        // v4.1 NEW-DEFECT-1 fix: replaced
+                                        // `>= SOLO_WARNING_THRESHOLD` with `>= 1` so the
+                                        // counter-reset acknowledgment log fires whenever
+                                        // a non-zero streak just got broken (was: only
+                                        // when streak reached 5+, which after lowering
+                                        // SOLO_PAUSE to 2 was unreachable).
+                                        if (consecutive_self_mined >= 1) {
                                             std::cout << "[Mining] Block from another miner received - solo mining counter reset" << std::endl;
                                         }
                                         consecutive_self_mined = 0;
-                                        solo_warning_shown = false;
 
                                         // Resume mining if paused due to consensus fork
                                         if (mining_paused_consensus_fork) {
@@ -7479,6 +7801,8 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
 
         // Clear ibd_coordinator pointer before local variable goes out of scope
         g_node_context.ibd_coordinator = nullptr;
+        // Phase 6 PR6.5a: also reset the sync_coordinator adapter.
+        g_node_context.sync_coordinator.reset();
 
         if (vdf_miner.IsRunning()) {
             std::cout << "[Shutdown] Stopping VDF miner..." << std::flush;

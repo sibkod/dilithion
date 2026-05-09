@@ -6,16 +6,25 @@
 #include <net/connman.h>
 #include <net/protocol.h>
 #include <net/peers.h>
+#include <net/port/header_proof_checkers.h>  // Phase 3: VDF + RandomX impls
+#include <consensus/chain_work.h>             // Phase 3 BLOCKER fix: shared chain-work helper
 #include <consensus/params.h>
 #include <consensus/pow.h>
 #include <consensus/chain.h>
 #include <util/time.h>
 #include <util/logging.h>  // For g_verbose flag
 #include <node/genesis.h>
-#include <node/ibd_coordinator.h>  // Phase 1: IsSynced() check
-#include <node/fork_manager.h>     // Validate-before-disconnect fork handling
+#include <net/port/sync_coordinator.h>  // Phase 6 PR6.5a: IsSynced() via adapter
+#include <consensus/ichain_selector.h>  // Phase 6 PR6.1: chain_selector wiring
+// PR5.5 (2026-04-26): node/fork_manager.h include retired from
+// HeadersManager. ForkManager-driven fork-cancellation defensive cleanup
+// during header invalidation has been removed in favor of relying on the
+// block-validation layer for fork resolution. ForkManager file remains
+// (Phase 7 deletes it) for ibd_coordinator + block_processing callers.
 #include <core/node_context.h>
 #include <core/chainparams.h>
+#include <net/banman.h>   // v4.1: MisbehaviorType for header checkpoint enforcement
+#include <net/peers.h>    // v4.1: CPeerManager::Misbehaving (already pulled by net/net.h but explicit for clarity)
 #include <api/metrics.h>  // Fork detection metrics
 #include <algorithm>
 #include <chrono>
@@ -30,14 +39,70 @@ extern CChainState g_chainstate;
 // Prevents false fork detection when peers send headers during initial startup.
 // Uses IsSynced() instead of time-based grace period - won't miss genuine forks.
 
+// =============================================================================
+// v4.1 — Header-time checkpoint enforcement helper
+// =============================================================================
+//
+// Direct hash compare against any embedded checkpoint at the EXACT batch
+// height. NO GetAncestor walk in the headers code path (Layer-2 v0.2 HIGH-5
+// fix: GetAncestor walks pskip pointers that are mutated outside cs_main,
+// which is unsafe in headers context where only cs_headers is held).
+//
+// Returns true if the header is acceptable (no checkpoint at this height,
+// or the checkpoint matches). Returns false if the header violates an
+// embedded checkpoint.
+//
+// Called from FIVE ingress sites in this file before each
+// `mapHeaders[...] = headerData` write:
+//   1. ProcessHeaders FAST PATH 1 (below-checkpoint)
+//   2. ProcessHeaders slow path (above-checkpoint, after ValidateHeader)
+//   3. ProcessHeadersWithDoSProtection (DoS-protected redownload)
+//   4. QueueHeadersForValidation STEP 2 (below-checkpoint)
+//   5. QueueHeadersForValidation STEP 2 (above-checkpoint)
+//
+// On rejection, the caller should bump peer misbehavior via
+// CPeerManager::Misbehaving(peer, 20, MisbehaviorType::INVALID_BLOCK_HEADER)
+// and return false to abort the batch.
+static bool CheckpointCheckHeader(int height, const uint256& headerHash) {
+    if (!Dilithion::g_chainParams) return true;
+    for (const auto& cp : Dilithion::g_chainParams->checkpoints) {
+        if (cp.nHeight == height) {
+            if (headerHash != cp.hashBlock) {
+                LogPrintf(NET, WARN,
+                    "[HeadersManager] v4.1 header-time check: checkpoint violation at height %d "
+                    "(got %s, expected %s) -- rejecting batch\n",
+                    height,
+                    headerHash.GetHex().substr(0, 16).c_str(),
+                    cp.hashBlock.GetHex().substr(0, 16).c_str());
+                return false;
+            }
+            return true;
+        }
+    }
+    return true;  // no checkpoint at this height
+}
+
 CHeadersManager::CHeadersManager()
     : nBestHeight(-1)
 {
     hashBestHeader = uint256();
 
-    // Bug #46 Fix: Initialize minimum chain work to zero (accept all chains initially)
-    // Production networks should set this to a reasonable threshold to prevent DoS
-    nMinimumChainWork = uint256();
+    // Phase 3: read minimum chain work from chainparams (was hardcoded 0).
+    nMinimumChainWork = (Dilithion::g_chainParams != nullptr)
+        ? Dilithion::g_chainParams->nMinimumChainWork
+        : uint256();
+
+    // Phase 3: pick the chain-agnostic proof checker. DilV (VDF-only chain)
+    // ships VDFHeaderProofChecker; DIL ships RandomXHeaderProofChecker.
+    // The HeadersSyncState instances we construct below get a non-owning
+    // pointer to this; lifetime: owned by manager, outlives all states.
+    if (Dilithion::g_chainParams && Dilithion::g_chainParams->IsDilV()) {
+        m_proof_checker =
+            std::make_unique<::dilithion::net::port::VDFHeaderProofChecker>();
+    } else {
+        m_proof_checker =
+            std::make_unique<::dilithion::net::port::RandomXHeaderProofChecker>();
+    }
 
     // BUG FIX: Add genesis to mapHeaders so block 1 can accumulate chain work properly
     // Without this, block 1's pprev is nullptr and chainWork doesn't include genesis work
@@ -50,6 +115,17 @@ CHeadersManager::CHeadersManager()
     genesisData.chainWork = genesisWork;
     mapHeaders[genesisHash] = genesisData;
     AddToHeightIndex(genesisHash, 0);
+
+    // Phase 6 PR6.1 (v1.5 fix-up 2026-04-27 per Cursor verification follow-up):
+    // Genesis is NOT wired to chain_selector here. Same justification as
+    // BulkLoadHeaders below: chain_selector's mapBlockIndex receives genesis
+    // through CChainState's own AddBlockIndex call during chainstate init,
+    // which happens BEFORE g_node_context.chain_selector is even
+    // constructed. Wiring here would either fail (chain_selector pointer
+    // is null at HeadersManager construction time) or be redundant once
+    // chain_selector is up. If init order ever changes such that
+    // chain_selector outlives HeadersManager construction, add the wiring
+    // here in a guarded block.
 
     // Set genesis as initial best header
     hashBestHeader = genesisHash;
@@ -74,19 +150,55 @@ CHeadersManager::~CHeadersManager()
         mapHeaders.clear();
         mapHeightIndex.clear();
         setChainTips.clear();
+        m_chainTipsLastSeen.clear();  // Phase 6 PR6.2
         mapPeerStates.clear();
         mapPeerStartHeight.clear();
         m_rejectedHashes.clear();
         m_bestChainCache.clear();
     }
 
-    // Clear chain tips tracker
-    m_chainTipsTracker.Clear();
+    // PR5.2.B: m_chainTipsTracker retired — setChainTips above already
+    // serves as the canonical leaf set; no separate cache to clear.
 }
 
 // ============================================================================
 // Public API: Header Processing
 // ============================================================================
+
+// Phase 6 PR6.1 (v1.5 §4 PR6.1 + DoS guards): per-peer header rate limit.
+// Sliding-by-reset window. Caller MUST already hold cs_headers.
+//
+// Window + limit pulled from chainparams (Cursor v1.5+ per-spec fix B1):
+//   * ChainParams.nHeaderRateWindowSec
+//   * ChainParams.nHeaderRateLimitPerWindow
+// Defaults (60s / 1000 headers) match the prior hardcoded values, so
+// behavior is unchanged unless a factory overrides. If g_chainParams
+// is null (test fixtures without setup), fall back to the same defaults.
+bool CHeadersManager::CheckPeerHeaderRateLimit(NodeId peer, size_t batchSize)
+{
+    const int64_t now_sec = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+
+    int window_sec = 60;
+    int limit      = 5000;  // v4.1: bumped 1000->5000 to match chainparams default + standard MAX_HEADERS_RESULTS=2000 batch
+    if (Dilithion::g_chainParams) {
+        if (Dilithion::g_chainParams->nHeaderRateWindowSec > 0) {
+            window_sec = Dilithion::g_chainParams->nHeaderRateWindowSec;
+        }
+        if (Dilithion::g_chainParams->nHeaderRateLimitPerWindow > 0) {
+            limit = Dilithion::g_chainParams->nHeaderRateLimitPerWindow;
+        }
+    }
+
+    auto& rate = m_peerHeaderRate[peer];
+    if (now_sec - rate.window_start_unix_sec >= window_sec) {
+        // Window expired — start a fresh window.
+        rate.window_start_unix_sec = now_sec;
+        rate.headers_in_window = 0;
+    }
+    rate.headers_in_window += static_cast<int>(batchSize);
+    return rate.headers_in_window <= limit;
+}
 
 bool CHeadersManager::ProcessHeaders(NodeId peer, const std::vector<CBlockHeader>& headers)
 {
@@ -101,6 +213,22 @@ bool CHeadersManager::ProcessHeaders(NodeId peer, const std::vector<CBlockHeader
     int chainstateHeightPreFetched = (pTipPreFetched && pTipPreFetched->nHeight > 0) ? pTipPreFetched->nHeight : 0;
 
     std::lock_guard<std::mutex> lock(cs_headers);
+
+    // Phase 6 PR6.1: per-peer rate limit. Drop the batch if peer is over budget.
+    // v4.1 audit fix (twin of headers_manager.cpp:2495 fix in commit 3c5e0eb):
+    // promote log to always-on WARN. This is one of two twins of the bug that
+    // hid the rate-limit reject from operators during IBD. Always log so the
+    // diagnostic trail is visible without --verbose.
+    if (!headers.empty() && !CheckPeerHeaderRateLimit(peer, headers.size())) {
+        LogPrintf(NET, WARN,
+            "[HeadersManager] Rate-limit reject (Process): peer=%d batch=%zu "
+            "(window limit = %d/%ds)\n",
+            static_cast<int>(peer),
+            headers.size(),
+            Dilithion::g_chainParams ? Dilithion::g_chainParams->nHeaderRateLimitPerWindow : 5000,
+            Dilithion::g_chainParams ? Dilithion::g_chainParams->nHeaderRateWindowSec : 60);
+        return false;
+    }
     if (g_verbose.load(std::memory_order_relaxed))
         std::cout << "[HeadersManager] Lock acquired" << std::endl;
 
@@ -169,6 +297,16 @@ bool CHeadersManager::ProcessHeaders(NodeId peer, const std::vector<CBlockHeader
         // so there's no reason to compute expensive RandomX PoW hashes.
         // But we MUST still store headers so the chain walk in
         // GetBestChainHashAtHeight() works during IBD block fetching.
+        //
+        // Phase 3 disposition (Q3 plan recommended PR3.4 deletion): Patch H
+        // STAYS until Phase 5 retires the legacy `ProcessHeaders` path. The
+        // upstream-pattern HeadersSyncStateV2 (Phase 3) bypasses this code
+        // entirely (its `pow_validated_headers` get pushed into mapHeaders
+        // through ProcessHeadersWithDoSProtection's success path), but
+        // ProcessHeaders is still reachable for non-DoS-protected callers.
+        // Deleting Patch H now would re-introduce the silent-drop bug for
+        // any flow that lands here. Phase 5's chain-selection rewrite is the
+        // natural retirement point.
         if (expectedHeight <= highestCheckpoint) {
             // Patch H (v4.0.22) -- Compute incoming hash and check for true
             // duplicate. PRIOR BUG: if mapHeightIndex already had ANY header
@@ -200,6 +338,13 @@ bool CHeadersManager::ProcessHeaders(NodeId peer, const std::vector<CBlockHeader
             // cumulative chain-work comparison can pick the canonical chain
             // over a stuck wrong-fork sibling.
             int height = pprev ? (pprev->height + 1) : expectedHeight;
+            // v4.1 site 1/5: header-time checkpoint enforcement (BEFORE store)
+            if (!CheckpointCheckHeader(height, storageHash)) {
+                if (g_node_context.peer_manager) {
+                    g_node_context.peer_manager->Misbehaving(peer, 20, MisbehaviorType::INVALID_BLOCK_HEADER);
+                }
+                return false;
+            }
             uint256 chainWork = CalculateChainWork(header, pprev);
             HeaderWithChainWork headerData(header, height);
             headerData.chainWork = chainWork;
@@ -207,6 +352,16 @@ bool CHeadersManager::ProcessHeaders(NodeId peer, const std::vector<CBlockHeader
             AddToHeightIndex(storageHash, height);
             UpdateChainTips(storageHash);   // Patch H -- register competing tip
             UpdateBestHeader(storageHash);  // Patch H -- re-evaluate active chain
+
+            // Phase 6 PR6.1: chain_selector wiring. Every accepted header
+            // populates chain_selector's mapBlockIndex with a pre-validation
+            // entry so chain_selector can authoritatively answer fork-detection
+            // queries. Failure return is non-fatal (orphan / invalid parent);
+            // chain_selector's own DoS guards apply.
+            if (g_node_context.chain_selector) {
+                (void)g_node_context.chain_selector->ProcessNewHeader(header);
+            }
+
             pprev = &mapHeaders[storageHash];
             prevHash = storageHash;
             if (heightStart < 0) heightStart = height;
@@ -338,8 +493,8 @@ bool CHeadersManager::ProcessHeaders(NodeId peer, const std::vector<CBlockHeader
                     // BUG #261 FIX: Only signal fork if node is synced
                     // During startup/IBD, headers with "unknown parents" are normal
                     // because we're still loading/syncing. Only treat as fork if synced.
-                    bool is_synced = g_node_context.ibd_coordinator &&
-                                     g_node_context.ibd_coordinator->IsSynced();
+                    bool is_synced = g_node_context.sync_coordinator &&
+                                     g_node_context.sync_coordinator->IsSynced();
                     if (is_synced) {
                         g_node_context.fork_detected.store(true);
                         g_metrics.SetForkDetected(true, 0, 0);
@@ -360,6 +515,14 @@ bool CHeadersManager::ProcessHeaders(NodeId peer, const std::vector<CBlockHeader
         int height = pprev ? (pprev->height + 1) : 1;
         uint256 chainWork = CalculateChainWork(header, pprev);
 
+        // v4.1 site 2/5: header-time checkpoint enforcement (BEFORE store)
+        if (!CheckpointCheckHeader(height, storageHash)) {
+            if (g_node_context.peer_manager) {
+                g_node_context.peer_manager->Misbehaving(peer, 20, MisbehaviorType::INVALID_BLOCK_HEADER);
+            }
+            return false;
+        }
+
         // Store header
         HeaderWithChainWork headerData(header, height);
         headerData.chainWork = chainWork;
@@ -368,6 +531,11 @@ bool CHeadersManager::ProcessHeaders(NodeId peer, const std::vector<CBlockHeader
 
         UpdateChainTips(storageHash);
         UpdateBestHeader(storageHash);
+
+        // Phase 6 PR6.1: chain_selector wiring (normal path).
+        if (g_node_context.chain_selector) {
+            (void)g_node_context.chain_selector->ProcessNewHeader(header);
+        }
 
         // FORK RESOLUTION: Check if this header was a pending parent
         // If so, the fork is resolving - clear from pending and check if fully resolved
@@ -424,6 +592,24 @@ bool CHeadersManager::ProcessHeaders(NodeId peer, const std::vector<CBlockHeader
 
 bool CHeadersManager::ProcessHeadersWithDoSProtection(NodeId peer, const std::vector<CBlockHeader>& headers)
 {
+    // Phase 6 PR6.1: per-peer rate limit. Same policy as ProcessHeaders.
+    // We hold cs_headers for the rate-limit check (same lock).
+    // v4.1 audit fix (twin of headers_manager.cpp:2495 fix in commit 3c5e0eb):
+    // log the reject so operators can see the cause. Was completely silent.
+    {
+        std::lock_guard<std::mutex> lock(cs_headers);
+        if (!headers.empty() && !CheckPeerHeaderRateLimit(peer, headers.size())) {
+            LogPrintf(NET, WARN,
+                "[HeadersManager] Rate-limit reject (DoS): peer=%d batch=%zu "
+                "(window limit = %d/%ds)\n",
+                static_cast<int>(peer),
+                headers.size(),
+                Dilithion::g_chainParams ? Dilithion::g_chainParams->nHeaderRateLimitPerWindow : 5000,
+                Dilithion::g_chainParams ? Dilithion::g_chainParams->nHeaderRateWindowSec : 60);
+            return false;
+        }
+    }
+
     // Check if peer has active HeadersSyncState
     auto it = mapHeadersSyncStates.find(peer);
     if (it == mapHeadersSyncStates.end()) {
@@ -470,6 +656,17 @@ bool CHeadersManager::ProcessHeadersWithDoSProtection(NodeId peer, const std::ve
 
             // Calculate chain work and store
             uint256 chainWork = CalculateChainWork(header, pprev);
+
+            // v4.1 site 3/5: header-time checkpoint enforcement (BEFORE store)
+            // NOTE: this site uses `hash` (declared at start of loop body),
+            // NOT `storageHash` — Layer-2 v0.3 #2 caught this distinction.
+            if (!CheckpointCheckHeader(height, hash)) {
+                if (g_node_context.peer_manager) {
+                    g_node_context.peer_manager->Misbehaving(peer, 20, MisbehaviorType::INVALID_BLOCK_HEADER);
+                }
+                return false;
+            }
+
             HeaderWithChainWork headerData(header, height);
             headerData.chainWork = chainWork;
 
@@ -477,6 +674,11 @@ bool CHeadersManager::ProcessHeadersWithDoSProtection(NodeId peer, const std::ve
             AddToHeightIndex(hash, height);
             UpdateChainTips(hash);
             UpdateBestHeader(hash);
+
+            // Phase 6 PR6.1: chain_selector wiring (DoS-protected REDOWNLOAD).
+            if (g_node_context.chain_selector) {
+                (void)g_node_context.chain_selector->ProcessNewHeader(header);
+            }
         }
 
     }
@@ -512,10 +714,12 @@ bool CHeadersManager::ShouldUseDoSProtection(NodeId peer) const
     }
 
     // Bug #150: Also activate if we have competing forks
-    // This helps protect against fork flooding attacks
-    if (m_chainTipsTracker.HasCompetingForks()) {
+    // This helps protect against fork flooding attacks.
+    // PR5.2.B: setChainTips replaces m_chainTipsTracker as the canonical
+    // leaf set — size > 1 means competing forks exist.
+    if (setChainTips.size() > 1) {
         std::cout << "[HeadersManager] DoS protection activated due to competing forks ("
-                  << m_chainTipsTracker.TipCount() << " tips)" << std::endl;
+                  << setChainTips.size() << " tips)" << std::endl;
         return true;
     }
 
@@ -545,13 +749,14 @@ bool CHeadersManager::InitializeDoSProtectedSync(NodeId peer, const uint256& min
         chainStartHeight = 0;
     }
 
-    // Create the state
+    // Create the state — Phase 3: pass the chain-agnostic proof checker.
     auto state = std::make_unique<HeadersSyncState>(
         peer,
         params,
         chainStartHash,
         chainStartHeight,
-        minimum_work
+        minimum_work,
+        m_proof_checker.get()
     );
 
     mapHeadersSyncStates[peer] = std::move(state);
@@ -675,7 +880,7 @@ bool CHeadersManager::SyncHeadersFromPeer(NodeId peer, int peer_height, bool for
     // The dedup logic is only needed during IBD to prevent request spam.
     // =========================================================================
 
-    if (g_node_context.ibd_coordinator && g_node_context.ibd_coordinator->IsSynced()) {
+    if (g_node_context.sync_coordinator && g_node_context.sync_coordinator->IsSynced()) {
         // Synced state: Use m_last_request_hash to continue fork chain sync
         // Bug #179 Fix: If we received headers from a fork, hashBestHeader won't update
         // (fork has less work), but m_last_request_hash has the last received fork header.
@@ -807,6 +1012,11 @@ void CHeadersManager::OnBlockActivated(const CBlockHeader& header, const uint256
     // Update best header
     UpdateBestHeader(hash);
 
+    // Phase 6 PR6.1: chain_selector wiring (post-activation hook).
+    // Idempotent on re-call (chain_selector handles dup as no-op).
+    if (g_node_context.chain_selector) {
+        (void)g_node_context.chain_selector->ProcessNewHeader(header);
+    }
 }
 
 void CHeadersManager::BulkLoadHeaders(const std::vector<CBlockIndex*>& chain)
@@ -837,6 +1047,16 @@ void CHeadersManager::BulkLoadHeaders(const std::vector<CBlockIndex*>& chain)
 
         // Track pointer for next iteration's chain work calculation
         pprev = &mapHeaders[hash];
+
+        // Phase 6 PR6.1 (v1.5 fix-up 2026-04-27 per Cursor "fix or document"):
+        // BulkLoadHeaders is the chain-replay path called at startup from
+        // CChainState's existing block index. chain_selector's mapBlockIndex
+        // is populated by CChainState's own AddBlockIndex during the same
+        // startup, so calling ProcessNewHeader here would be redundant
+        // (idempotent on chain_selector's side, but a wasted lookup per
+        // block). Intentionally NOT wired. If CChainState init order ever
+        // changes such that BulkLoadHeaders runs BEFORE chain_selector's
+        // own population, add the wiring here.
     }
 
     // Set best header to the tip (last element)
@@ -1023,10 +1243,84 @@ int CHeadersManager::GetBestHeight() const
     return nBestHeight;
 }
 
+CHeadersManager::SyncSnapshot CHeadersManager::GetSyncSnapshot() const
+{
+    // Phase 10 PR10.2: atomic snapshot under a SINGLE cs_headers acquisition.
+    // Eliminates Phase 9 PR9.6-RT-MEDIUM-2 (a) multi-lock tip-skew race.
+    //
+    // Body composes the same logic as GetSyncProgress() + GetBestHeight()
+    // + GetBestHeaderHash() but reads all three protected fields once
+    // under the lock. No new state is added; the lock-acquisition pattern
+    // matches the existing three getters (same mutex, same scope) — no
+    // new lock-ordering interaction with other subsystems.
+    std::lock_guard<std::mutex> lock(cs_headers);
+
+    SyncSnapshot snap;
+    snap.best_height = nBestHeight;
+    snap.best_hash = hashBestHeader;
+
+    // Progress: walk peer states for max claimed height, divide by ours.
+    if (mapPeerStates.empty()) {
+        snap.progress = 0.0;
+    } else {
+        int maxPeerHeight = nBestHeight;
+        for (const auto& pair : mapPeerStates) {
+            if (pair.second.nSyncHeight > maxPeerHeight) {
+                maxPeerHeight = pair.second.nSyncHeight;
+            }
+        }
+        snap.progress = (maxPeerHeight <= 0)
+            ? 0.0
+            : static_cast<double>(nBestHeight) / static_cast<double>(maxPeerHeight);
+    }
+
+    return snap;
+}
+
 uint256 CHeadersManager::GetBestHash() const
 {
     std::lock_guard<std::mutex> lock(cs_headers);
-    return m_chainTipsTracker.GetBestTip();
+    // PR5.2.B: walk setChainTips for max-work tip. setChainTips is small
+    // (typically O(1) tips, with rare O(N) during fork events); per-tip
+    // mapHeaders lookup is O(1). Net O(K) where K = tip count.
+    uint256 bestHash;
+    uint256 bestWork;
+    for (const auto& tipHash : setChainTips) {
+        auto it = mapHeaders.find(tipHash);
+        if (it == mapHeaders.end()) continue;
+        if (bestHash.IsNull() || ChainWorkGreaterThan(it->second.chainWork, bestWork)) {
+            bestHash = tipHash;
+            bestWork = it->second.chainWork;
+        }
+    }
+    return bestHash;
+}
+
+uint256 CHeadersManager::GetBestHeaderChainWork() const
+{
+    std::lock_guard<std::mutex> lock(cs_headers);
+    uint256 bestWork;
+    for (const auto& tipHash : setChainTips) {
+        auto it = mapHeaders.find(tipHash);
+        if (it == mapHeaders.end()) continue;
+        if (bestWork.IsNull() || ChainWorkGreaterThan(it->second.chainWork, bestWork)) {
+            bestWork = it->second.chainWork;
+        }
+    }
+    return bestWork;
+}
+
+std::vector<CHeadersManager::HeaderTipInfo> CHeadersManager::GetCompetingHeaderTips() const
+{
+    std::lock_guard<std::mutex> lock(cs_headers);
+    std::vector<HeaderTipInfo> out;
+    out.reserve(setChainTips.size());
+    for (const auto& tipHash : setChainTips) {
+        auto it = mapHeaders.find(tipHash);
+        if (it == mapHeaders.end()) continue;
+        out.push_back({tipHash, it->second.height, it->second.chainWork});
+    }
+    return out;
 }
 
 bool CHeadersManager::IsHeaderSyncInProgress() const
@@ -1135,7 +1429,8 @@ void CHeadersManager::OnPeerDisconnected(NodeId peer)
     mapPeerStates.erase(peer);
     mapPeerStartHeight.erase(peer);  // BUG #62: Clean up peer height tracking
     mapHeadersSyncStates.erase(peer);  // Clean up DoS protection state
-
+    m_peerHeaderRate.erase(peer);  // Phase 6 PR6.1 fix-up (subagent v1.5+ BLOCKER): prevent monotonic
+                                   // memory leak under Bitcoin-level peer churn
 }
 
 void CHeadersManager::SetPeerStartHeight(NodeId peer, int height)
@@ -1213,7 +1508,8 @@ void CHeadersManager::Clear()
     hashBestHeader = uint256();
     nBestHeight = -1;
     setChainTips.clear();
-    m_chainTipsTracker.Clear();
+    m_chainTipsLastSeen.clear();  // Phase 6 PR6.2: keep TTL map in sync with setChainTips
+    // PR5.2.B: m_chainTipsTracker retired; setChainTips.clear() above is sufficient.
     InvalidateBestChainCache();
 
     // Clear rejected hashes on full reset
@@ -1292,10 +1588,14 @@ void CHeadersManager::ClearAboveHeight(int keepHeight, const uint256& preferredH
     }
 
     // Clear chain tips and rebuild with just the best header
+    // PR5.2.B: m_chainTipsTracker retired; setChainTips alone is canonical.
     setChainTips.clear();
-    m_chainTipsTracker.Clear();
+    m_chainTipsLastSeen.clear();  // Phase 6 PR6.2: keep TTL map in sync
     if (!hashBestHeader.IsNull()) {
         setChainTips.insert(hashBestHeader);
+        const int64_t now_sec = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        m_chainTipsLastSeen[hashBestHeader] = now_sec;  // Phase 6 PR6.2: stamp the rebuilt tip
     }
 
     // Invalidate cache
@@ -1317,17 +1617,31 @@ void CHeadersManager::ClearAboveHeight(int keepHeight, const uint256& preferredH
 
 bool CHeadersManager::HasCompetingForks() const
 {
-    return m_chainTipsTracker.HasCompetingForks();
+    // PR5.2.B: setChainTips.size() > 1 ⇔ competing tips exist.
+    std::lock_guard<std::mutex> lock(cs_headers);
+    return setChainTips.size() > 1;
 }
 
 size_t CHeadersManager::GetForkCount() const
 {
-    return m_chainTipsTracker.TipCount();
+    std::lock_guard<std::mutex> lock(cs_headers);
+    return setChainTips.size();
 }
 
 std::string CHeadersManager::GetForkDebugInfo() const
 {
-    return m_chainTipsTracker.GetDebugInfo();
+    // PR5.2.B: format from setChainTips + mapHeaders rather than the
+    // retired m_chainTipsTracker. Same data, different source of truth.
+    std::lock_guard<std::mutex> lock(cs_headers);
+    std::string out = "Tips (" + std::to_string(setChainTips.size()) + "):\n";
+    for (const auto& tipHash : setChainTips) {
+        auto it = mapHeaders.find(tipHash);
+        if (it == mapHeaders.end()) continue;
+        out += "  hash=" + tipHash.GetHex().substr(0, 16) + "...";
+        out += " height=" + std::to_string(it->second.height);
+        out += " work=" + it->second.chainWork.GetHex().substr(0, 16) + "...\n";
+    }
+    return out;
 }
 
 bool CHeadersManager::GetParentHash(const uint256& hash, uint256& parentHash) const
@@ -1434,7 +1748,8 @@ size_t CHeadersManager::PruneOrphanedHeaders()
 
         // Keep chain tips that still have significant work
         // (Simplified: keep tips that are close to best work)
-        if (m_chainTipsTracker.IsTip(hash)) {
+        // PR5.2.B: setChainTips replaces m_chainTipsTracker as canonical leaf set.
+        if (setChainTips.count(hash) > 0) {
             // Keep this tip if it has at least some work (non-null)
             // More sophisticated pruning can compare work percentages later
             if (!header.chainWork.IsNull()) {
@@ -1459,8 +1774,9 @@ size_t CHeadersManager::PruneOrphanedHeaders()
             RemoveFromHeightIndex(hash, height);
 
             // Remove from chain tips (if present)
+            // PR5.2.B: m_chainTipsTracker retired; setChainTips alone.
             setChainTips.erase(hash);
-            m_chainTipsTracker.RemoveTip(hash);
+            m_chainTipsLastSeen.erase(hash);  // Phase 6 PR6.2
 
             // Remove the header itself
             mapHeaders.erase(it);
@@ -1566,8 +1882,9 @@ size_t CHeadersManager::InvalidateHeader(const uint256& hash)
                 }
 
                 // Remove from chain tips
+                // PR5.2.B: m_chainTipsTracker retired; setChainTips alone.
                 setChainTips.erase(h);
-                m_chainTipsTracker.RemoveTip(h);
+                m_chainTipsLastSeen.erase(h);  // Phase 6 PR6.2
 
                 // Remove from mapHeaders
                 mapHeaders.erase(headerIt);
@@ -1607,24 +1924,31 @@ size_t CHeadersManager::InvalidateHeader(const uint256& hash)
 
         InvalidateBestChainCache();
 
-        // VALIDATE-BEFORE-DISCONNECT: Cancel active fork if this header is part of it
-        // This ensures fork state is cleaned up when blocks fail validation
-        ForkManager& forkMgr = ForkManager::GetInstance();
-        if (forkMgr.HasActiveFork()) {
-            auto fork = forkMgr.GetActiveFork();
-            if (fork) {
-                // Check if the invalidated height falls within the fork range
-                int forkPoint = fork->GetForkPointHeight();
-                int forkTip = fork->GetExpectedTipHeight();
-                if (invalidHeight > forkPoint && invalidHeight <= forkTip) {
-                    std::cout << "[HeadersManager] Invalidated header is part of active fork, canceling fork" << std::endl;
-                    forkMgr.CancelFork("Header invalidated: " + hash.GetHex().substr(0, 16));
-                    forkMgr.ClearInFlightState(g_node_context, forkPoint);
-                    g_node_context.fork_detected.store(false);  // Clear fork flag
-                    g_metrics.ClearForkDetected();
-                }
-            }
-        }
+        // PR5.5 (2026-04-26): HeadersManager-side ForkManager retirement.
+        //
+        // Previously: when a header was invalidated, query ForkManager singleton
+        // for an active fork covering this height range and explicitly cancel
+        // it (CancelFork + ClearInFlightState) as defensive cleanup.
+        //
+        // Phase 5 retirement rationale:
+        //   * ForkManager is being retired across the codebase (Phase 7
+        //     deletes the file). Its remaining 52 call sites are in
+        //     ibd_coordinator + block_processing + block_fetcher (Phase 6
+        //     scope per plan §12 Q6).
+        //   * The 5 HeadersManager-side calls were a defensive cleanup path:
+        //     ensure fork state gets cancelled when a header on that fork
+        //     gets invalidated. Without these, fork state stays "active" a
+        //     bit longer until block-validation downstream detects the
+        //     invalidity and clears state itself.
+        //   * Net effect of retirement: minor delay in fork-state cleanup
+        //     during invalidation. Consensus correctness unaffected — the
+        //     block-validation layer is the authority for fork resolution,
+        //     not HeadersManager's defensive cleanup.
+        //
+        // Phase 6 will replace this with index-tree-driven fork detection
+        // via chain_selector once HeadersManager is wired to populate
+        // CChainState::mapBlockIndex on header receipt.
+        // (No-op intentional.)
     } else {
         // Header not in map, just track hash as rejected
         m_rejectedHashes.insert(hash);
@@ -1685,56 +2009,12 @@ uint256 CHeadersManager::CalculateChainWork(const CBlockHeader& header, const He
 
 uint256 CHeadersManager::GetBlockWork(uint32_t nBits) const
 {
-    // Bug #46 Fix: Implement proper work calculation
-    // Uses same logic as CBlockIndex::GetBlockProof()
-    // Bug #47 Fix: Use consensus CompactToBig instead of custom GetTarget
-
-    uint256 target = CompactToBig(nBits);
-    uint256 proof;
-    memset(proof.data, 0, 32);
-
-    // If target is zero, return max work (should never happen)
-    bool isZero = true;
-    for (int i = 0; i < 32; i++) {
-        if (target.data[i] != 0) {
-            isZero = false;
-            break;
-        }
-    }
-
-    if (isZero) {
-        memset(proof.data, 0xFF, 32);
-        return proof;
-    }
-
-    // Extract size and mantissa from nBits compact form
-    int size = nBits >> 24;
-    uint64_t mantissa = nBits & 0x00FFFFFF;
-
-    if (mantissa == 0) {
-        memset(proof.data, 0xFF, 32);
-        return proof;
-    }
-
-    // Calculate work = 2^(256 - 8*size) / mantissa
-    int work_exponent = 256 - 8 * size;
-    int work_byte_pos = work_exponent / 8;
-
-    // Clamp to valid range
-    if (work_byte_pos < 0) work_byte_pos = 0;
-    if (work_byte_pos > 31) work_byte_pos = 31;
-
-    // CID 1675253 FIX: Calculate reciprocal of mantissa scaled to 64 bits
-    // Note: mantissa > 0 is guaranteed here because we check mantissa == 0 and return early at line 766
-    // The ternary operator's else branch is dead code, so we simplify to just the division
-    uint64_t work_mantissa = 0xFFFFFFFFFFFFFFFFULL / mantissa;
-
-    // Store the work value at the appropriate byte position
-    for (int i = 0; i < 8 && (work_byte_pos + i) < 32; i++) {
-        proof.data[work_byte_pos + i] = (work_mantissa >> (i * 8)) & 0xFF;
-    }
-
-    return proof;
+    // Phase 3 Cursor BLOCKER fix (2026-04-26): consolidated through the
+    // shared helper `dilithion::consensus::ComputeChainWork`. Previously
+    // this method had its own full formula copy — third copy missed
+    // during Phase 3 Day 1 Day 1 helper extraction. Drift risk between
+    // headers-manager work and block-index work eliminated.
+    return dilithion::consensus::ComputeChainWork(nBits);
 }
 
 // Bug #47 Fix: Use consensus PoW functions instead of custom implementation
@@ -2032,42 +2312,124 @@ void CHeadersManager::UpdateChainTips(const uint256& hashNew)
     // Add the new header as a chain tip (legacy set)
     setChainTips.insert(hashNew);
 
+    // Phase 6 PR6.2: stamp last-seen for TTL aging.
+    const int64_t now_sec = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    m_chainTipsLastSeen[hashNew] = now_sec;
+
     // Remove its parent from chain tips (no longer a leaf)
+    // PR5.2.B: m_chainTipsTracker retired; setChainTips alone is canonical.
     auto it = mapHeaders.find(hashNew);
     if (it != mapHeaders.end()) {
         const HeaderWithChainWork& header = it->second;
         if (!header.hashPrevBlock.IsNull()) {
             setChainTips.erase(header.hashPrevBlock);
-            // Bug #150: Also update the new tracker
-            m_chainTipsTracker.RemoveTip(header.hashPrevBlock);
+            m_chainTipsLastSeen.erase(header.hashPrevBlock);
+        }
+    }
+
+    // Phase 6 PR6.2: TTL aging — evict tips not re-seen within
+    // 30 blocks worth of time (KISS: derived from chainparams.blockTime,
+    // no new config required). DIL (240s blocks) → 7200s = 2 hours;
+    // DilV (60s blocks) → 1800s = 30 minutes. Per-peer admission
+    // limit DEFERRED to Phase 6.x (needs canonical peer-attribution
+    // source — see v1.5 plan §3.3). Runs BEFORE the cap eviction
+    // below: if TTL drops the count under the cap, no further
+    // eviction needed.
+    if (Dilithion::g_chainParams) {
+        const int blockTime = Dilithion::g_chainParams->blockTime;
+        const int64_t ttl_sec = static_cast<int64_t>(blockTime) * 30;
+        const int64_t cutoff = now_sec - ttl_sec;
+        // Don't evict the just-inserted tip; only stale ones.
+        for (auto lsit = m_chainTipsLastSeen.begin();
+             lsit != m_chainTipsLastSeen.end(); ) {
+            if (lsit->first == hashNew) { ++lsit; continue; }
+            if (lsit->second < cutoff) {
+                setChainTips.erase(lsit->first);
+                lsit = m_chainTipsLastSeen.erase(lsit);
+            } else {
+                ++lsit;
+            }
+        }
+    }
+
+    // CONCERN #2 fix (red-team audit 2026-04-26): bound setChainTips
+    // size with eviction-by-lowest-work. Without this cap, an attacker
+    // who feeds disjoint forks can grow setChainTips monotonically;
+    // each ibd_coordinator tick then walks O(K) entries. At K >> 1000
+    // this becomes a DoS amplifier.
+    //
+    // 256 is a balance: well above realistic tip-counts during normal
+    // operation (typically 1-2; rare bursts to ~10 during fork events)
+    // but well below pathological growth. When the cap is exceeded,
+    // evict the LOWEST-work tip — these are the least useful for any
+    // future reorg consideration.
+    //
+    // Validation pass 2026-04-26: tiebreaker concern — when multiple
+    // tips share the same chainWork, an attacker who grinds nonces can
+    // control which uint256 hash sorts lowest in std::set iteration.
+    // Mitigation: NEVER evict any tip whose chainWork equals the best
+    // chainWork — protect honest tips against same-work attackers.
+    static constexpr size_t MAX_CHAIN_TIPS = 256;
+    if (setChainTips.size() > MAX_CHAIN_TIPS) {
+        // First pass: compute best chainWork (we MUST NOT evict any
+        // tip at this work level).
+        uint256 bestWork;
+        for (const auto& tipHash : setChainTips) {
+            auto tipIt = mapHeaders.find(tipHash);
+            if (tipIt == mapHeaders.end()) continue;
+            if (bestWork.IsNull() || ChainWorkGreaterThan(tipIt->second.chainWork, bestWork)) {
+                bestWork = tipIt->second.chainWork;
+            }
         }
 
-        // Bug #150: Add to the new chain tips tracker with chain work
-        m_chainTipsTracker.AddOrUpdateTip(hashNew, header.height, header.chainWork);
+        // Second pass: collect orphans (purge ALL of them, not just first)
+        // and find lowest-strictly-below-best work.
+        std::vector<uint256> orphans;
+        uint256 worstHash;
+        uint256 worstWork;
+        bool worstSet = false;
+        for (const auto& tipHash : setChainTips) {
+            if (std::memcmp(tipHash.data, hashNew.data, 32) == 0) continue;
+            auto tipIt = mapHeaders.find(tipHash);
+            if (tipIt == mapHeaders.end()) {
+                orphans.push_back(tipHash);
+                continue;
+            }
+            // Skip tips whose work equals best — attacker-influenceable
+            // tiebreaker would otherwise let them target honest tips.
+            if (!ChainWorkGreaterThan(bestWork, tipIt->second.chainWork)) {
+                continue;
+            }
+            if (!worstSet || ChainWorkGreaterThan(worstWork, tipIt->second.chainWork)) {
+                worstHash = tipHash;
+                worstWork = tipIt->second.chainWork;
+                worstSet = true;
+            }
+        }
+
+        // Sweep orphans first (free cleanup, lowest-priority entries).
+        for (const auto& o : orphans) {
+            setChainTips.erase(o);
+            m_chainTipsLastSeen.erase(o);  // Phase 6 PR6.2: keep timestamp map in sync
+        }
+        // If still over cap and we found a strictly-below-best target, evict it.
+        if (setChainTips.size() > MAX_CHAIN_TIPS && worstSet) {
+            setChainTips.erase(worstHash);
+            m_chainTipsLastSeen.erase(worstHash);  // Phase 6 PR6.2: keep timestamp map in sync
+        }
+        // Edge case: if EVERY non-just-inserted tip is at best chainWork
+        // (extreme stress under nonce-grinding attack), no eviction
+        // happens — set grows above cap until honest activity introduces
+        // a new best. Prefer this over evicting honest tips.
     }
 }
 
 uint256 CHeadersManager::AddChainWork(const uint256& blockProof, const uint256& parentChainWork) const
 {
-    // Implement same logic as CBlockIndex::BuildChainWork()
-    // Simple byte-by-byte addition with carry
-    uint256 result;
-    uint32_t carry = 0;
-
-    for (int i = 0; i < 32; i++) {
-        uint32_t sum = (uint32_t)parentChainWork.data[i] +
-                      (uint32_t)blockProof.data[i] +
-                      carry;
-        result.data[i] = sum & 0xFF;
-        carry = sum >> 8;
-    }
-
-    // Handle overflow - saturate at maximum value
-    if (carry != 0) {
-        memset(result.data, 0xFF, 32);
-    }
-
-    return result;
+    // Phase 3 Cursor BLOCKER fix (2026-04-26): consolidated through the
+    // shared helper. Sum is commutative; argument-order is irrelevant.
+    return dilithion::consensus::AddChainWork(blockProof, parentChainWork);
 }
 
 // ============================================================================
@@ -2142,6 +2504,24 @@ bool CHeadersManager::FullValidateHeader(const CBlockHeader& header, int height)
 
 bool CHeadersManager::QueueHeadersForValidation(NodeId peer, const std::vector<CBlockHeader>& headers)
 {
+    // Phase 6 PR6.1: per-peer rate limit. Same policy as ProcessHeaders.
+    // v4.1: added log message — previously silent return false here hid the
+    // cause when the limit was set too low (1000 vs MAX_HEADERS_RESULTS=2000),
+    // making IBD failures untraceable. Always log the rate-limit reject.
+    {
+        std::lock_guard<std::mutex> lock(cs_headers);
+        if (!headers.empty() && !CheckPeerHeaderRateLimit(peer, headers.size())) {
+            LogPrintf(NET, WARN,
+                "[HeadersManager] Rate-limit reject (Queue): peer=%d batch=%zu "
+                "(window limit = %d/%ds)\n",
+                static_cast<int>(peer),
+                headers.size(),
+                Dilithion::g_chainParams ? Dilithion::g_chainParams->nHeaderRateLimitPerWindow : 5000,
+                Dilithion::g_chainParams ? Dilithion::g_chainParams->nHeaderRateWindowSec : 60);
+            return false;
+        }
+    }
+
     if (!m_validation_running.load()) {
         std::cerr << "[HeadersManager] Validation thread not running, falling back to sync" << std::endl;
         return ProcessHeaders(peer, headers);
@@ -2508,6 +2888,13 @@ bool CHeadersManager::QueueHeadersForValidation(NodeId peer, const std::vector<C
                     // Store with cumulative chain work but skip PoW validation
                     // (below checkpoint, trust anchor handles validity).
                     int height = pprev ? (pprev->height + 1) : expectedHeight;
+                    // v4.1 site 4/5: header-time checkpoint enforcement (BEFORE store)
+                    if (!CheckpointCheckHeader(height, storageHash)) {
+                        if (g_node_context.peer_manager) {
+                            g_node_context.peer_manager->Misbehaving(peer, 20, MisbehaviorType::INVALID_BLOCK_HEADER);
+                        }
+                        return false;
+                    }
                     uint256 chainWork = CalculateChainWork(header, pprev);
                     HeaderWithChainWork headerData(header, height);
                     headerData.chainWork = chainWork;
@@ -2515,11 +2902,23 @@ bool CHeadersManager::QueueHeadersForValidation(NodeId peer, const std::vector<C
                     AddToHeightIndex(storageHash, height);
                     UpdateChainTips(storageHash);   // register competing tip
                     UpdateBestHeader(storageHash);  // re-evaluate active chain
+
+                    // Phase 6 PR6.1 (v1.5 fix-up 2026-04-27 per dual-validation):
+                    // chain_selector wiring on the QueueHeadersForValidation
+                    // below-checkpoint async path. Both reviewers (Cursor +
+                    // subagent) flagged the original overnight diff missed
+                    // these mapHeaders writes — this is the busiest path
+                    // during IBD.
+                    if (g_node_context.chain_selector) {
+                        (void)g_node_context.chain_selector->ProcessNewHeader(header);
+                    }
+
                     pprev = &mapHeaders[storageHash];
                     prevHash = storageHash;
                     totalProcessed++;
                     continue;  // Skip PoW validation but header is now stored
                 }
+
 
                 // Skip TRUE duplicates (same hash already exists)
                 if (mapHeaders.find(storageHash) != mapHeaders.end()) {
@@ -2559,6 +2958,14 @@ bool CHeadersManager::QueueHeadersForValidation(NodeId peer, const std::vector<C
                 int height = pprev ? (pprev->height + 1) : 1;
                 uint256 chainWork = CalculateChainWork(header, pprev);
 
+                // v4.1 site 5/5: header-time checkpoint enforcement (BEFORE store)
+                if (!CheckpointCheckHeader(height, storageHash)) {
+                    if (g_node_context.peer_manager) {
+                        g_node_context.peer_manager->Misbehaving(peer, 20, MisbehaviorType::INVALID_BLOCK_HEADER);
+                    }
+                    return false;
+                }
+
                 // Store header
                 HeaderWithChainWork headerData(header, height);
                 headerData.chainWork = chainWork;
@@ -2566,6 +2973,14 @@ bool CHeadersManager::QueueHeadersForValidation(NodeId peer, const std::vector<C
                 AddToHeightIndex(storageHash, height);
                 UpdateChainTips(storageHash);
                 UpdateBestHeader(storageHash);
+
+                // Phase 6 PR6.1 (v1.5 fix-up 2026-04-27 per dual-validation):
+                // chain_selector wiring on the QueueHeadersForValidation
+                // above-checkpoint path. Companion to the below-checkpoint
+                // wiring ~50 lines above. Both reviewers flagged this gap.
+                if (g_node_context.chain_selector) {
+                    (void)g_node_context.chain_selector->ProcessNewHeader(header);
+                }
 
                 // Queue for background PoW validation (only for blocks above checkpoint)
                 if (expectedHeight > checkpointHeight) {

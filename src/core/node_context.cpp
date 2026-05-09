@@ -12,7 +12,14 @@
 #include <node/block_validation_queue.h>  // Phase 2: Async block validation
 #include <digital_dna/dna_registry_db.h>  // Digital DNA: LevelDB-backed registry
 #include <digital_dna/verification_manager.h>  // Phase 2: DNA Verification & Attestation
+#include <consensus/ichain_selector.h>             // Phase 5: frozen interface
+#include <consensus/port/chain_selector_impl.h>    // Phase 5: ChainSelectorAdapter
+#include <node/fork_manager.h>                     // Phase 11 A1: ForkManager wiring
+#include <net/port/sync_coordinator.h>             // Phase 6 PR6.5a: ISyncCoordinator complete type for unique_ptr destructor
 #include <util/logging.h>
+
+#include <cstdlib>  // std::getenv
+#include <cstring>  // std::strcmp
 
 // Global node context instance
 NodeContext g_node_context;
@@ -49,6 +56,47 @@ bool NodeContext::Init(const std::string& datadir, CChainState* chainstate_ptr) 
     }
 
     chainstate = chainstate_ptr;
+
+    // Phase 5: instantiate chain selector adapter over the chainstate.
+    // The adapter is a thin wrapper; lifetime is tied to NodeContext
+    // and MUST be reset before chainstate is freed (handled in Shutdown/Reset).
+    //
+    // v4.1 IBD silent-drop construction gate (RETAINED in v4.3 as operator
+    // opt-in). The underlying AddBlockIndex flag-merge bug is fixed by
+    // Phase 11 ABI (commit 3a0c2ea above), but we keep this gate to preserve
+    // operator control per Phase 5 PR5.4 partition-risk lesson and the v4.3
+    // emergency deploy review. Setting DILITHION_USE_NEW_CHAIN_SELECTOR=1
+    // is the operator's explicit opt-in to engage the new chain-selection
+    // logic AND the Phase 11 A1 fork-staging adapter.
+    //
+    // The 6 ProcessNewHeader call sites in headers_manager.cpp and the 2
+    // use_port_pm gates in dilithion-node.cpp / dilv-node.cpp already
+    // null-check chain_selector. NodeContext::WireForkStaging() (called by
+    // node startup once blockchain_db is set) is null-safe — it's a no-op
+    // when chain_selector is nullptr (env-var unset).
+    //
+    // Activation: wrapper /root/run-dilv-seed.sh exports
+    // DILITHION_USE_NEW_CHAIN_SELECTOR=1 to enable the port chain selector.
+    // The companion --usenewpeerman flag was retired in v4.3.4 (Block 8 of
+    // Option C cut) — the chain-selector env-var is now an independent toggle.
+    // Without the env-var, chain_selector stays null and the legacy
+    // chain.cpp validation path runs (fail-loud).
+    try {
+        const char* selector_env = std::getenv("DILITHION_USE_NEW_CHAIN_SELECTOR");
+        const bool use_new_selector = (selector_env != nullptr) && (std::strcmp(selector_env, "1") == 0);
+        if (use_new_selector) {
+            chain_selector = std::make_unique<::dilithion::consensus::port::ChainSelectorAdapter>(*chainstate);
+            LogPrintf(ALL, INFO, "v4.3: chain selector adapter wired (env-var=1, opt-in; A1 fork-staging deferred until WireForkStaging)");
+        } else {
+            chain_selector = nullptr;
+            LogPrintf(ALL, INFO,
+                "v4.3: chain selector adapter SUPPRESSED (default; set "
+                "DILITHION_USE_NEW_CHAIN_SELECTOR=1 to engage new path)");
+        }
+    } catch (const std::exception& e) {
+        LogPrintf(ALL, ERROR, "Failed to instantiate chain selector adapter: %s", e.what());
+        return false;
+    }
 
     // Initialize peer manager
     try {
@@ -132,6 +180,52 @@ bool NodeContext::Init(const std::string& datadir, CChainState* chainstate_ptr) 
     return true;
 }
 
+bool NodeContext::WireForkStaging() {
+    // Phase 11 A1: rebuild the chain selector adapter with the ForkManager
+    // singleton + blockchain_db wired in, enabling fork-staging dispatch
+    // on ProcessNewBlock. Idempotent — calling twice with the same db is
+    // safe (we just reconstruct the adapter, which is a thin wrapper).
+    //
+    // v4.3 conflict-resolution: respect the v4.1 IBD silent-drop construction
+    // gate retained at NodeContext::Init. If chain_selector was suppressed
+    // there (env-var unset → chain_selector == nullptr), the operator did NOT
+    // opt in to the new path; do NOT silently construct a staging-enabled
+    // adapter here. Stay null. The 6 ProcessNewHeader / 2 use_port_pm null
+    // checks downstream rely on this.
+    if (!chain_selector) {
+        LogPrintf(ALL, INFO,
+                  "WireForkStaging: chain_selector was suppressed at Init "
+                  "(DILITHION_USE_NEW_CHAIN_SELECTOR != 1); fork-staging stays disabled");
+        return true;  // Not an error — operator opted out via env-var.
+    }
+    if (!chainstate || !blockchain_db) {
+        LogPrintf(ALL, WARN,
+                  "WireForkStaging: prerequisites not ready (chainstate=%s, blockchain_db=%s); "
+                  "fork-staging stays in Phase-5 mode",
+                  chainstate ? "ok" : "null",
+                  blockchain_db ? "ok" : "null");
+        return false;
+    }
+
+    try {
+        // Reset BEFORE constructing the new adapter — both reference the same
+        // CChainState&, but the unique_ptr swap is atomic enough for our
+        // single-threaded startup invocation. NodeContext::WireForkStaging is
+        // called from the main thread before any block-receive thread starts,
+        // so no concurrent chain_selector access is possible during the swap.
+        chain_selector.reset();
+        chain_selector = std::make_unique<::dilithion::consensus::port::ChainSelectorAdapter>(
+            *chainstate,
+            &ForkManager::GetInstance(),
+            blockchain_db);
+        LogPrintf(ALL, INFO, "Phase 11 A1: chain selector adapter re-wired with fork-staging dispatch");
+        return true;
+    } catch (const std::exception& e) {
+        LogPrintf(ALL, ERROR, "WireForkStaging failed: %s", e.what());
+        return false;
+    }
+}
+
 void NodeContext::Shutdown() {
     LogPrintf(ALL, INFO, "Shutting down NodeContext...");
 
@@ -186,6 +280,10 @@ void NodeContext::Shutdown() {
     }
     SetDNACollector(nullptr);
 
+    // Phase 5: reset chain selector BEFORE clearing chainstate (adapter
+    // holds a non-owning reference into chainstate).
+    chain_selector.reset();
+
     // Clear pointers
     chainstate = nullptr;
     rpc_server = nullptr;
@@ -198,6 +296,8 @@ void NodeContext::Shutdown() {
 }
 
 void NodeContext::Reset() {
+    // Phase 5: reset selector BEFORE clearing chainstate.
+    chain_selector.reset();
     chainstate = nullptr;
     peer_manager.reset();
     connman.reset();  // Phase 2: Reset CConnman

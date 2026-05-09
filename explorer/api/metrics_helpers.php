@@ -129,6 +129,14 @@ function getNodesOnline(int $rpcPort, string $chain): ?array {
         if (is_array($c) && isset($c['nodesOnline'])) return $c;
     }
 
+    // HYBRID resolution (cut → main integration, 2026-05-09):
+    //   - Keep main's _acquireSingleFlight wrapper + try/finally (PR #49 production fix
+    //     against thundering-herd cache stampede).
+    //   - Adopt cut's response-accounting: count seed as responding on HTTP 200 + any
+    //     non-empty body, even if peer list parses empty (avoids undercounting).
+    //   - Use cut's extractPeerIPsFromGetpeerinfo() helper (defined below) instead of
+    //     inline regex (cleaner, single-source-of-truth for peer extraction).
+    //   - Include cut's uniquePeers alias in result for v0 explorer clients.
     $lock = _acquireSingleFlight($cacheFile);
     if (!$lock) {
         if (file_exists($cacheFile)) {
@@ -173,34 +181,34 @@ function getNodesOnline(int $rpcPort, string $chain): ?array {
             curl_multi_select($multi, 0.1);
         } while ($running > 0);
 
-        $peerSet         = [];
-        $seedsResponding = 0;
+        $peerSet          = [];
+        $seedsResponding  = 0;
         foreach ($handles as $ch) {
             $resp = curl_multi_getcontent($ch);
             $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
             curl_multi_remove_handle($multi, $ch);
             curl_close($ch);
             if ($code !== 200 || !$resp) continue;
-            // The node sometimes emits malformed JSON in getpeerinfo when a peer's
-            // subversion string contains unescaped quotes (e.g. "/Dilithion:"v3.8.3"/").
-            // So we skip full JSON parsing and just regex-extract the addr fields —
-            // that's all we need, and it's robust to the malformed subver case.
-            // TODO: fix at the node level so getpeerinfo emits valid JSON.
-            if (!preg_match_all('/"addr"\s*:\s*"([^"\s]+?)(?:[:\s].*?)?"/', $resp, $m)) continue;
+
+            // Cut's response-accounting: HTTP 200 + non-empty body = seed is responding,
+            // regardless of whether peer list happens to be empty/unparseable.
             $seedsResponding++;
-            foreach ($m[1] as $ipPort) {
-                $ipOnly = preg_replace('/:\d+$/', '', $ipPort);
-                if ($ipOnly !== '') $peerSet[$ipOnly] = true;
+
+            $extracted = extractPeerIPsFromGetpeerinfo($resp);
+            foreach ($extracted as $ip => $_) {
+                $peerSet[$ip] = true;
             }
         }
         curl_multi_close($multi);
 
+        // Include the seeds themselves (they're nodes too, don't see themselves as peers).
         foreach (SEED_NODES as [$pubIp,]) {
             $peerSet[$pubIp] = true;
         }
 
         $result = [
             'nodesOnline'     => count($peerSet),
+            'uniquePeers'     => count($peerSet),  // alias — clearer name for v0
             'seedsResponding' => $seedsResponding,
             'seedsTotal'      => count(SEED_NODES),
             'computedAt'      => time(),
@@ -210,6 +218,66 @@ function getNodesOnline(int $rpcPort, string $chain): ?array {
     } finally {
         _releaseSingleFlight($lock);
     }
+}
+
+/**
+ * Extract unique peer IPs from a getpeerinfo response body.
+ *
+ * Strategy:
+ *   1. Try a clean JSON parse. If it succeeds, walk the result array — most
+ *      reliable, gets every well-formed peer entry.
+ *   2. If JSON parse fails (e.g. some peer's subver contains unescaped quotes
+ *      and breaks the document), fall back to regex extraction of `"addr": "…"`
+ *      pairs from the raw bytes. Less complete but resilient.
+ *
+ * Returns an associative array keyed by IP (port stripped, IPv6 brackets
+ * removed) — so the caller can union it with other seeds' results for free.
+ */
+function extractPeerIPsFromGetpeerinfo(string $resp): array {
+    $ips = [];
+
+    // Path 1: clean JSON parse.
+    $data = @json_decode($resp, true);
+    if (is_array($data) && isset($data['result']) && is_array($data['result'])) {
+        foreach ($data['result'] as $peer) {
+            if (!is_array($peer)) continue;
+            $addr = $peer['addr'] ?? null;
+            if (!is_string($addr) || $addr === '') continue;
+            $ip = normalizePeerIP($addr);
+            if ($ip !== '') $ips[$ip] = true;
+        }
+        return $ips;
+    }
+
+    // Path 2: regex fallback for malformed-subver case.
+    // `addr` values themselves never contain quotes, so this captures cleanly
+    // even when other fields in the same peer entry are corrupt.
+    if (preg_match_all('/"addr"\s*:\s*"([^"]+)"/', $resp, $m)) {
+        foreach ($m[1] as $addr) {
+            $ip = normalizePeerIP($addr);
+            if ($ip !== '') $ips[$ip] = true;
+        }
+    }
+    return $ips;
+}
+
+/**
+ * Strip the port suffix from an addr string and return the IP only.
+ * Handles both IPv4 (`192.0.2.1:8444`) and IPv6 (`[::1]:8444`) forms.
+ */
+function normalizePeerIP(string $addr): string {
+    $addr = trim($addr);
+    if ($addr === '') return '';
+    // IPv6 bracketed form: [::1]:8444 → ::1
+    if ($addr[0] === '[') {
+        $end = strpos($addr, ']');
+        if ($end !== false) {
+            return substr($addr, 1, $end - 1);
+        }
+        return '';
+    }
+    // IPv4 form: strip a trailing `:port` if present.
+    return preg_replace('/:\d+$/', '', $addr);
 }
 
 /**

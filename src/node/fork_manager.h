@@ -23,6 +23,32 @@ namespace Dilithion {
 /**
  * @brief Singleton manager for fork validation and chain switching
  *
+ * ## Port-survival note (Phase 7 v0.3, 2026-05-01)
+ *
+ * The ForkManager + ForkCandidate pair is a Dilithion-specific
+ * consensus-adjacent layer that wraps chain_selector. It is NOT present
+ * in upstream Bitcoin Core: upstream relies on max-cumulative-work
+ * selection alone, accepting transient reorg windows that the
+ * 2026-04-25 incident demonstrated are unsafe at Dilithion's current
+ * scale and miner topology. Validate-Before-Disconnect (this class) is
+ * how Dilithion mitigates that.
+ *
+ * This file SURVIVES the v4.1 port via the LEGACY block-receive path.
+ * Fork-staging fires when block_processing::ProcessNewBlock is invoked
+ * (9 sites: dilithion-node.cpp x3, dilv-node.cpp x3, ibd_coordinator.cpp x3).
+ * Post v4.3.4 Option C cut, all operational paths use the legacy
+ * entry points (the port-CPeerManager-driven HandleBlock path that
+ * could have bypassed fork-staging was retired in Block 6, and the
+ * port::CPeerManager class itself was deleted in Block 7). Fork-
+ * staging is therefore fully operational on every block-arrival path
+ * under all flag values. The "Path A1 vs Path A2" bypass concern that
+ * existed pre-cut is moot — there is no bypass path remaining.
+ * Retirement of this file clusters with `ibd_coordinator` retirement
+ * if/when v5 architectural review revisits IBD orchestration; see
+ * `.claude/contracts/v5_architecture_decision_prep.md`.
+ *
+ * ## What ForkManager does
+ *
  * The ForkManager implements "validate before disconnect" - fork blocks
  * are staged and pre-validated (PoW + MIK) before any chain changes occur.
  *

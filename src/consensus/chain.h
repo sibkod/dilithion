@@ -6,11 +6,13 @@
 
 #include <node/block_index.h>
 #include <primitives/block.h>
+#include <consensus/pow.h>      // Phase 5: ChainWorkGreaterThan for candidate-set comparator
+#include <functional>
 #include <map>
+#include <set>                  // Phase 5: m_setBlockIndexCandidates
 #include <vector>
 #include <memory>
 #include <mutex>
-#include <functional>
 #include <atomic>
 #include <chrono>
 
@@ -19,6 +21,82 @@ class CBlockchainDB;
 class CUTXOSet;
 class CReorgWAL;
 class CTxMemPool;  // BUG #109 FIX: Mempool for confirmed TX cleanup
+
+/**
+ * Phase 5: Comparator for ordering CBlockIndex candidates by chain work.
+ *
+ * Used by CChainState::m_setBlockIndexCandidates to maintain a strict
+ * weak ordering with the heaviest-work block first. Tiebreakers (in order):
+ *   1. Strictly greater chain work (ChainWorkGreaterThan)
+ *   2. v4.3.3 F9: Lower vdfOutput on equal-work DilV siblings
+ *      (consensus-deterministic; matches legacy ShouldReplaceVDFTip)
+ *   3. Lower nSequenceId (earlier local insertion order — fallback)
+ *   4. Pointer comparison (deterministic within a process)
+ *
+ * Mirrors upstream Bitcoin Core's `CBlockIndexWorkComparator` in
+ * `validation.cpp` v28 PLUS the DilV-specific VDF tiebreak from the
+ * legacy path. The selection algorithm pops the front of the set; that
+ * block is the candidate-best leaf for the next reorg.
+ *
+ * v4.3.3 F9 (canary 4 mid-deploy fix, 2026-05-04):
+ * Before F9 the comparator only used upstream's tiebreak (chainwork →
+ * nSequenceId → pointer). nSequenceId is assigned at AddBlockIndex time
+ * by LOCAL processing order, so two nodes that received sibling blocks
+ * in different order would assign different nSequenceIds and pick
+ * different siblings on equal-chainwork forks. Legacy DilV's
+ * ShouldReplaceVDFTip (chain.cpp:226-260) uses pindex->header.vdfOutput
+ * (block-intrinsic, consensus-deterministic) — every node agrees on the
+ * winner. F9 ports that rule into the comparator BEFORE the nSequenceId
+ * fallback so port and legacy paths agree on equal-work sibling
+ * selection. NULL-safe for DIL chain (RandomX, no VDF) and for pre-VDF
+ * activation DilV blocks: if either vdfOutput is null/zero, comparator
+ * falls through to nSequenceId.
+ *
+ * Note: F9 is only the ORDERING rule. Legacy `ShouldReplaceVDFTip` also
+ * has a temporal grace-period gate (m_vdfTipAcceptTime check) that
+ * prevents oscillation after a tip is accepted. That's a separate
+ * concern handled at activation logic, not at the comparator level.
+ *
+ * SCOPE NOTE (Cursor v4.3.3 review S8 LOW, 2026-05-04):
+ * the F9 vdfOutput tie-break runs whenever chainwork is equal and both
+ * vdfOutputs are non-null — it does NOT explicitly gate on "same-height
+ * sibling only." In production this is benign because:
+ *   * chainwork is the cumulative sum of (1/target) over the chain;
+ *     equal chainwork at different heights would require difficulty
+ *     asymmetry across the diverging parts of the two chains —
+ *     extremely rare on DIL (RandomX+ASERT) and impossible on DilV
+ *     (constant-difficulty VDF distribution).
+ *   * Even if F9 ordered cross-height candidates "wrongly" by
+ *     vdfOutput, the actual REORG decision is gated downstream at
+ *     ActivateBestChain by F10's same-height + same-parent + equal-
+ *     chainwork check. Cross-height candidates fall through to the
+ *     normal chainwork-greater path and reorg correctly.
+ * Documented per Cursor's request rather than hardening the comparator
+ * itself; an in-comparator height check would add a chain.h dependency
+ * on CBlockIndex::nHeight and is unnecessary given the downstream gate.
+ */
+struct CBlockIndexWorkComparator {
+    bool operator()(const CBlockIndex* a, const CBlockIndex* b) const {
+        if (ChainWorkGreaterThan(a->nChainWork, b->nChainWork)) return true;
+        if (ChainWorkGreaterThan(b->nChainWork, a->nChainWork)) return false;
+        // v4.3.3 F9: VDF lowest-output tiebreak. Block-intrinsic and
+        // consensus-deterministic. Skipped on null vdfOutput (DIL chain
+        // or pre-VDF DilV) so legacy non-VDF behavior is unchanged.
+        const uint256& vdfA = a->header.vdfOutput;
+        const uint256& vdfB = b->header.vdfOutput;
+        if (!vdfA.IsNull() && !vdfB.IsNull()) {
+            if (HashLessThan(vdfA, vdfB)) return true;
+            if (HashLessThan(vdfB, vdfA)) return false;
+        }
+        if (a->nSequenceId < b->nSequenceId) return true;
+        if (b->nSequenceId < a->nSequenceId) return false;
+        // Phase 5 red-team CONCERN fix: raw `a < b` between separately-
+        // allocated objects is unspecified in C++17. std::less<T*> is
+        // explicitly required to provide a total order across all pointers
+        // of the type, regardless of whether they point into the same array.
+        return std::less<const CBlockIndex*>{}(a, b);
+    }
+};
 
 /**
  * Chain State Manager
@@ -84,6 +162,82 @@ private:
     uint256 m_last_undo_failure_hash;
     mutable std::mutex m_undo_failure_mutex;
     static constexpr int kPersistentUndoFailureThreshold = 3;
+
+public:
+    // v4.3.3 F11 (Layer-3 round 2 MEDIUM-1): cause classification for
+    // m_chain_needs_rebuild. The same flag is set by multiple distinct
+    // failure modes — UndoBlock-undo (legacy v4.0.19), ReadBlock /
+    // ConnectTip / WriteBestBlock failures mid-reorg (v4.3.1 BLOCKER #1
+    // sites), and reorg-depth-cap rejection (v4.3.3 F8). The M1 helper
+    // (Dilithion::MaybeTriggerChainRebuild) needs to know WHY in order
+    // to emit a non-misleading [CRITICAL] banner and reason string.
+    //
+    // Default-initialized to UndoFailure (the only cause pre-F8); F8's
+    // depth-rejection site sets DepthRejection BEFORE flipping
+    // m_chain_needs_rebuild, so the helper observes the cause atomically
+    // with the flag. First-set-wins semantics: M1 helper's once-latch
+    // means only the first cause to fire is reported.
+    enum class ChainRebuildReason : uint32_t {
+        UndoFailure          = 0,  // BUG #277 persistent UndoBlock failure (chain.cpp:2257)
+        DepthRejection       = 1,  // v4.3.3 F8: MAX_REORG_DEPTH exceeded (depth ≠ invalid)
+        // v4.3.3 F16 (Layer-3 round 3 INFO-1): pre-F16 the ConnectTip-failure
+        // and WriteBestBlock-failure sites in chain.cpp were mislabeled
+        // "Persistent UndoBlock failure" by the M1 helper. F16 introduces
+        // distinct cause classes so operator-facing banners are accurate
+        // for each failure mode.
+        ConnectTipFailure    = 2,  // chain.cpp:716/2812/2917 ConnectTip after disconnect/reorg
+        DisconnectTipFailure = 3,  // chain.cpp:2842 DisconnectTip mid-reorg failure
+        ReadBlockFailure     = 4,  // chain.cpp:2870/2887 ReadBlock fail with disconnects committed
+        WriteBestBlockFailure = 5, // chain.cpp:2956 per-step WriteBestBlock failure (BLOCKER #1)
+    };
+private:
+    std::atomic<ChainRebuildReason> m_chain_rebuild_reason{
+        ChainRebuildReason::UndoFailure};
+
+    // ============================================================
+    // Phase 5: TEST-ONLY hooks for Patch B equivalence harness.
+    // ============================================================
+    //
+    // These std::function hooks let the Day 4 equivalence test inject
+    // controllable success/failure for the inner DisconnectTip/ConnectTip
+    // primitives, without standing up the full validation pipeline (UTXO
+    // mutations, MIK/DNA/cooldown checks, RandomX/VDF proofs).
+    //
+    // Production code MUST NOT set these. Default-constructed
+    // std::function is empty; the production path checks `if (hook)`
+    // and falls through to the real implementation when unset — zero
+    // perf cost, zero behavior change in release.
+    //
+    // Used by chain_case_2_5_equivalence_tests.cpp ONLY.
+public:
+    using ConnectTipOverride = std::function<bool(CBlockIndex*, const CBlock&)>;
+    using DisconnectTipOverride = std::function<bool(CBlockIndex*)>;
+    using WriteBestBlockOverride = std::function<bool(const uint256&)>;
+    // Phase 5 Day 4 V1: when set, ActivateBestChainStep consults this
+    // INSTEAD of pdb->ReadBlock when fetching blocks for connect loop
+    // retries. Lets unit tests serve block data from an in-memory map
+    // without standing up a real CBlockchainDB. Production never sets this.
+    using ReadBlockOverride = std::function<bool(const uint256&, CBlock&)>;
+
+    void SetTestConnectTipOverride(ConnectTipOverride h) { m_testConnectTipOverride = std::move(h); }
+    void SetTestDisconnectTipOverride(DisconnectTipOverride h) { m_testDisconnectTipOverride = std::move(h); }
+    void SetTestWriteBestBlockOverride(WriteBestBlockOverride h) { m_testWriteBestBlockOverride = std::move(h); }
+    void SetTestReadBlockOverride(ReadBlockOverride h) { m_testReadBlockOverride = std::move(h); }
+private:
+    ConnectTipOverride m_testConnectTipOverride;
+    DisconnectTipOverride m_testDisconnectTipOverride;
+    WriteBestBlockOverride m_testWriteBestBlockOverride;
+    ReadBlockOverride m_testReadBlockOverride;
+
+    // ============================================================
+    // Phase 5: block-index-tree-based chain selection (PR5.1 scaffold)
+    // ============================================================
+    //
+    // Set of leaf candidates ordered by descending chain work. The front
+    // is the heaviest-work leaf — the next reorg target. Maintained by
+    // ProcessNewHeader / AddBlockIndex / InvalidateBlockImpl /
+    // ReconsiderBlockImpl. Empty until PR5.3 wires population.
+    std::set<CBlockIndex*, CBlockIndexWorkComparator> m_setBlockIndexCandidates;
 
     // Bug #40 fix: Callback mechanism for tip updates
     // Allows HeadersManager and other components to be notified when chain tip changes
@@ -176,6 +330,64 @@ public:
     uint256 GetLastUndoFailureHash() const;
 
     /**
+     * v4.3.3 F11 (Layer-3 round 2 MEDIUM-1): read the cause that flagged
+     * m_chain_needs_rebuild. M1 helper consults this to choose a non-
+     * misleading [CRITICAL] banner. Atomic load — safe to call without
+     * cs_main.
+     */
+    ChainRebuildReason GetChainRebuildReason() const {
+        return m_chain_rebuild_reason.load(std::memory_order_acquire);
+    }
+
+    /**
+     * v4.3.3 F11: atomic flag-and-reason setter. Stores the reason FIRST
+     * (release semantics) then sets the rebuild flag — so any reader that
+     * observes m_chain_needs_rebuild=true via acquire-load is guaranteed
+     * to see the reason that was set in the same logical operation.
+     *
+     * First-cause-wins: M1 helper has a process-lifetime once-latch, so
+     * only the first cause to fire is ever reported. Subsequent calls
+     * are still recorded (the flag and reason are sticky-set) but the
+     * helper bails at the latch.
+     */
+    void FlagChainRebuild(ChainRebuildReason reason) {
+        m_chain_rebuild_reason.store(reason, std::memory_order_release);
+        m_chain_needs_rebuild.store(true, std::memory_order_release);
+    }
+
+    /**
+     * v4.3.3 F10 + F15 (Layer-3 round 3 HIGH-1, 2026-05-04): anchor the
+     * VDF grace-period clock ONLY when a block at a NEW height connects.
+     * Mirrors legacy semantics:
+     *   - chain.cpp:622-627 (Case 2: extend-by-one to a NEW height) → anchor.
+     *   - chain.cpp:723 (Case 2.5: sibling replacement at SAME height) →
+     *     "Do NOT reset m_vdfTipAcceptTime — the grace window is anchored
+     *     to the FIRST block at this height, preventing infinite
+     *     replacement chains."
+     *
+     * Predicate: anchor only when `p->nHeight != m_vdfTipAcceptHeight`
+     * (forward progress). Pre-F15 the anchor fired on EVERY successful
+     * ConnectTip, including Case 2.5 replacements — letting a stream of
+     * incoming lower-vdfOutput siblings within the original grace window
+     * perpetuate replacements indefinitely. F15 closes that gap.
+     *
+     * Also gates on:
+     *   - Block version >= 4 (VDF blocks).
+     *   - p->nHeight >= vdfLotteryActivationHeight (post-VDF activation).
+     *   - g_chainParams non-null.
+     *
+     * Public + virtual-free: callable from the connect-loop and from
+     * unit tests directly without setting up a full ActivateBestChainStep
+     * fixture.
+     *
+     * Returns true if the anchor was actually updated, false if the
+     * predicate did not fire (already anchored at this height, or
+     * not VDF-applicable). Tests use the return value to assert
+     * first-arrival-only semantics.
+     */
+    bool MaybeAnchorVdfGrace(CBlockIndex* p);
+
+    /**
      * v4.0.19: Record an UndoBlock failure for a specific block.
      * Increments counter if same hash as last failure, resets to 1 if different.
      * Sets m_chain_needs_rebuild when threshold reached.
@@ -230,8 +442,28 @@ public:
     void SetTipForTest(CBlockIndex* pindex) { pindexTip = pindex; }
 
     /**
-     * Add block index to in-memory map
-     * HIGH-C001 FIX: Now takes unique_ptr for automatic ownership transfer
+     * Add (or merge) a block index entry in the in-memory map.
+     *
+     * HIGH-C001 FIX: Takes unique_ptr for automatic ownership transfer.
+     *
+     * Phase 11 ABI flag-merge semantics: if an entry for `hash` already
+     * exists (normal during the headers-sync → block-data sequence on
+     * the new peer manager / chain selector path), this MERGES the new
+     * entry's nStatus bits into the existing entry via bitwise OR, and
+     * adopts a previously-null pprev pointer if the new caller supplies
+     * one. The incoming `pindex` is dropped on the merge path.
+     *
+     * Topology must agree on duplicate calls — same height, same chain
+     * work, same parent (when both have one). Disagreement trips a
+     * ConsensusInvariant.
+     *
+     * Returns true on first-time add OR successful merge. Returns false
+     * only when `pindex == nullptr`. Aborts via Invariant/ConsensusInvariant
+     * on hash mismatch, missing parent, or topology disagreement.
+     *
+     * This replaces the v4.1 silent-return-false-on-duplicate semantics
+     * that left header-prepopulated entries stuck at BLOCK_VALID_HEADER
+     * forever (SYD mainnet IBD silent-drop, 2026-05-02).
      */
     bool AddBlockIndex(const uint256& hash, std::unique_ptr<CBlockIndex> pindex);
 
@@ -245,6 +477,34 @@ public:
      * Check if block index exists in memory
      */
     bool HasBlockIndex(const uint256& hash) const;
+
+    /**
+     * Phase 6 PR6.1: number of entries in mapBlockIndex.
+     * Used by ChainSelectorAdapter::ProcessNewHeader for cap eviction
+     * (chainparams.nMapBlockIndexCap). Read is racy without cs_main but
+     * the cap is sized for sustained-attack-rate so race-window overshoot
+     * is irrelevant.
+     */
+    size_t GetBlockIndexSize() const { return mapBlockIndex.size(); }
+
+    /**
+     * Phase 6 PR6.1 (v1.5 §3.2 + Cursor v1.5+ A1): evict lowest-work
+     * entry NOT on the active chain. Called by ChainSelectorAdapter when
+     * mapBlockIndex hits chainparams.nMapBlockIndexCap to make room for
+     * a new pre-validation header.
+     *
+     * Eviction policy: walk mapBlockIndex, find the entry with minimum
+     * nChainWork that is NOT an ancestor of pindexTip; remove from
+     * m_setBlockIndexCandidates if present, then erase from
+     * mapBlockIndex. Holds cs_main for the duration to avoid use-after-
+     * free against chain_selector pointers in m_setBlockIndexCandidates.
+     *
+     * Returns true on successful eviction. Returns false if the only
+     * remaining entries are on the active chain (caller should fall back
+     * to fail-closed, but this case is essentially unreachable at
+     * production cap sizes — DIL=500K cap vs ~24K active chain height).
+     */
+    bool EvictLowestWorkNotOnBestChain();
 
     /**
      * Find the last common ancestor between two chains
@@ -331,16 +591,27 @@ public:
 
     /**
      * Get all chain tips (blocks with no children in the block index)
-     * Used by block explorer to show fork visibility
+     * Used by block explorer to show fork visibility AND by Phase 5
+     * ChainSelectorAdapter::GetChainTips (which maps string status to
+     * the frozen ChainTipInfo::Status enum).
      *
-     * Returns vector of tuples: (height, hash, branchlen, status)
-     * Status: "active" = main chain tip, "valid-fork" = valid alternative, "headers-only" = no block data
+     * Status taxonomy (Phase 5 Finding F3 — extended from 2 to 5 values):
+     *   "active"        — pindex == pindexTip (main chain tip)
+     *   "invalid"       — pindex->IsInvalid() (BLOCK_FAILED_VALID/CHILD)
+     *   "valid-fork"    — non-active tip, block fully validated (>= BLOCK_VALID_TRANSACTIONS)
+     *   "valid-headers" — non-active tip, header validated (>= BLOCK_VALID_HEADER) but block not
+     *   "unknown"       — non-active tip with no validation level recorded
+     *
+     * chain_work mirrors pindex->nChainWork at the time of the call —
+     * used by the adapter to populate ChainTipInfo::chain_work without
+     * a second mapBlockIndex lookup.
      */
     struct ChainTip {
         int height;
         uint256 hash;
         int branchlen;
         std::string status;
+        uint256 chain_work;  // Phase 5: mirrors pindex->nChainWork
     };
     std::vector<ChainTip> GetChainTips() const;
 
@@ -373,6 +644,84 @@ public:
      * @param callback Function to call with block data and height
      */
     void RegisterBlockDisconnectCallback(BlockDisconnectCallback callback);
+
+    // ============================================================
+    // Phase 5: chain-selection helpers (PR5.1 declarations only)
+    // ============================================================
+    //
+    // These methods hold the actual block-index-tree algorithm. The
+    // ChainSelectorAdapter in src/consensus/port/chain_selector_impl.cpp
+    // is a thin wrapper that forwards into these. Real bodies land in
+    // PR5.3 — PR5.1 ships assert(false) so the type system + linker are
+    // exercised end-to-end.
+
+    /**
+     * Phase 5: pop max-work candidate leaf; if any ancestor is invalid,
+     * mark BLOCK_FAILED_CHILD, remove from candidates, retry.
+     * Returns the heaviest valid leaf or nullptr.
+     */
+    CBlockIndex* FindMostWorkChainImpl();
+
+    /**
+     * Phase 5: walk back to common ancestor and forward to pindexMostWork,
+     * calling DisconnectTip / ConnectTip at each step. WAL-wrapped.
+     * On ConnectTip failure: mark BLOCK_FAILED_VALID, set fInvalidFound.
+     */
+    bool ActivateBestChainStep(CBlockIndex* pindexMostWork,
+                               std::shared_ptr<const CBlock> pblock_optional,
+                               bool& fInvalidFound);
+
+    /**
+     * Phase 5: mark pindex BLOCK_FAILED_VALID; propagate BLOCK_FAILED_CHILD
+     * to descendants; remove invalid leaves from candidate set; trigger
+     * re-selection.
+     */
+    bool InvalidateBlockImpl(const uint256& hash);
+
+    /**
+     * Phase 5: reverse InvalidateBlockImpl. Clear failure flags on pindex
+     * and descendants; re-add eligible leaves to candidate set; trigger
+     * re-selection.
+     */
+    bool ReconsiderBlockImpl(const uint256& hash);
+
+    /**
+     * Phase 5: set BLOCK_FAILED_VALID on pindex AND propagate
+     * BLOCK_FAILED_CHILD to all descendants in mapBlockIndex.
+     */
+    void MarkBlockAsFailed(CBlockIndex* pindex);
+
+    /**
+     * Phase 5: clear BLOCK_FAILED_VALID and BLOCK_FAILED_CHILD on pindex
+     * AND its descendants.
+     */
+    void MarkBlockAsValid(CBlockIndex* pindex);
+
+    /**
+     * Phase 5: full rescan of mapBlockIndex; rebuilds m_setBlockIndexCandidates
+     * from scratch. Called after major topology changes (Reconsider, startup).
+     */
+    void RecomputeCandidates();
+
+    /**
+     * v4.3.3 F6 (audit modality 2 HIGH-5): prune the candidate set of any
+     * entry whose chainwork is strictly less than the current tip's. Mirrors
+     * upstream Bitcoin Core's `PruneBlockIndexCandidates` at validation.cpp:3164.
+     * Called after each successful tip activation in ActivateBestChainStep.
+     *
+     * Bounds memory growth (without it, every fork sibling and its leaves
+     * stay in the candidate set forever) and ensures FindMostWorkChainImpl's
+     * comparator-walk only considers entries that could actually be selected.
+     *
+     * Never erases the active tip itself.
+     */
+    void PruneBlockIndexCandidates();
+
+    /**
+     * Phase 5: predicate — pindex is a leaf, has BLOCK_VALID_TRANSACTIONS,
+     * is not invalid, and has more work than current tip.
+     */
+    bool IsBlockACandidateForActivation(CBlockIndex* pindex) const;
 
     /**
      * RACE CONDITION FIX: Get a thread-safe snapshot of the chain path

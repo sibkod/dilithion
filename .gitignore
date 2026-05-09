@@ -1,5 +1,13 @@
 # Dilithion .gitignore
 
+# Autonomous mode transient files (.claude/autonomous/)
+.claude/autonomous/STOP
+.claude/autonomous/STARTED.txt
+.claude/autonomous/STARTED_AT_HEAD.txt
+.claude/autonomous/HEARTBEAT.txt
+.claude/autonomous/pending_cleanup.txt
+.claude/autonomous/active/
+
 # Build artifacts
 *.o
 *.lo
@@ -659,3 +667,8 @@ src/digital_dna/fingerprint_run*.json
 /test-security-fixes.bat
 /run-test-simple.bat
 /build_tests.bat
+
+# Local working drafts (cross-session handoff docs not for tracked history)
+docs/EXPLORER-TXINDEX-HANDOFF-FOR-ZACH.md
+docs/ROADMAP-MAINNET-PRODUCTION-PARITY.md
+docs/WALLET-INTEGRATION-QUESTIONS-FOR-ZACH.md

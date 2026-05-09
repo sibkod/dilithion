@@ -5,6 +5,7 @@
 
 #include <net/headerssync.h>
 #include <consensus/pow.h>
+#include <consensus/chain_work.h>  // Phase 3: shared chain-work helper
 #include <crypto/sha3.h>
 #include <util/time.h>
 
@@ -22,7 +23,8 @@ HeadersSyncState::HeadersSyncState(
     const HeadersSyncParams& params,
     const uint256& chain_start_hash,
     int64_t chain_start_height,
-    const uint256& minimum_work
+    const uint256& minimum_work,
+    const ::dilithion::net::IHeaderProofChecker* proof_checker
 )
     : m_id(peer_id),
       m_params(params),
@@ -34,7 +36,8 @@ HeadersSyncState::HeadersSyncState(
       m_current_height(chain_start_height),
       m_redownload_buffer_last_height(0),
       m_process_all_remaining_headers(false),
-      m_download_state(State::PRESYNC)
+      m_download_state(State::PRESYNC),
+      m_proof_checker(proof_checker)
 {
     // Initialize chain work to zero
     memset(m_current_chain_work.data, 0, 32);
@@ -219,8 +222,17 @@ bool HeadersSyncState::ValidateAndStoreHeadersCommitments(
 }
 
 bool HeadersSyncState::ValidateAndProcessSingleHeader(const CBlockHeader& header) {
-    // 1. Check proof of work (skip for VDF blocks which use VDF proof instead)
-    if (!header.IsVDFBlock()) {
+    // 1. Phase 3: route the proof check through the chain-agnostic
+    // IHeaderProofChecker if injected. Falls back to the legacy inline
+    // `IsVDFBlock()` branch + CheckProofOfWork path if no checker was
+    // passed (un-migrated test callsites).
+    if (m_proof_checker) {
+        if (!m_proof_checker->CheckHeaderProof(header)) {
+            std::cerr << "[HeadersSyncState] Invalid proof for header "
+                      << header.GetHash().GetHex().substr(0, 16) << "..." << std::endl;
+            return false;
+        }
+    } else if (!header.IsVDFBlock()) {
         uint256 hash = header.GetHash();
         if (!CheckProofOfWork(hash, header.nBits)) {
             std::cerr << "[HeadersSyncState] Invalid PoW for header "
@@ -262,9 +274,15 @@ bool HeadersSyncState::ValidateAndProcessSingleHeader(const CBlockHeader& header
 // ============================================================================
 
 bool HeadersSyncState::ValidateAndStoreRedownloadedHeader(const CBlockHeader& header) {
-    // 1. Validate PoW (skip for VDF blocks which use VDF proof instead)
+    // 1. Phase 3: route through IHeaderProofChecker if injected (same
+    // pattern as ValidateAndProcessSingleHeader above).
     uint256 hash = header.GetHash();
-    if (!header.IsVDFBlock()) {
+    if (m_proof_checker) {
+        if (!m_proof_checker->CheckHeaderProof(header)) {
+            std::cerr << "[HeadersSyncState] Invalid proof in REDOWNLOAD" << std::endl;
+            return false;
+        }
+    } else if (!header.IsVDFBlock()) {
         if (!CheckProofOfWork(hash, header.nBits)) {
             std::cerr << "[HeadersSyncState] Invalid PoW in REDOWNLOAD" << std::endl;
             return false;
@@ -373,54 +391,12 @@ bool HeadersSyncState::CalculateCommitment(const uint256& hash) const {
 }
 
 uint256 HeadersSyncState::GetBlockWork(uint32_t nBits) const {
-    // Same calculation as CHeadersManager::GetBlockWork()
-    uint256 proof;
-    memset(proof.data, 0, 32);
-
-    int size = nBits >> 24;
-    uint64_t mantissa = nBits & 0x00FFFFFF;
-
-    if (mantissa == 0) {
-        memset(proof.data, 0xFF, 32);
-        return proof;
-    }
-
-    // Calculate work = 2^(256 - 8*size) / mantissa
-    int work_exponent = 256 - 8 * size;
-    int work_byte_pos = work_exponent / 8;
-
-    if (work_byte_pos < 0) work_byte_pos = 0;
-    if (work_byte_pos > 31) work_byte_pos = 31;
-
-    // CID 1675253/1675270 FIX: Calculate reciprocal of mantissa scaled to 64 bits
-    // Note: mantissa > 0 is guaranteed here because we check mantissa == 0 and return early at line 377
-    // The ternary operator's else branch was dead code, so we simplified to just the division
-    // This eliminates the logical contradiction where mantissa > 0 was always true at this point
-    uint64_t work_mantissa = 0xFFFFFFFFFFFFFFFFULL / mantissa;
-
-    for (int i = 0; i < 8 && (work_byte_pos + i) < 32; i++) {
-        proof.data[work_byte_pos + i] = (work_mantissa >> (i * 8)) & 0xFF;
-    }
-
-    return proof;
+    // Phase 3 (2026-04-26): consolidated through shared helper.
+    return dilithion::consensus::ComputeChainWork(nBits);
 }
 
 uint256 HeadersSyncState::AddChainWork(const uint256& a, const uint256& b) const {
-    uint256 result;
-    uint32_t carry = 0;
-
-    for (int i = 0; i < 32; i++) {
-        uint32_t sum = (uint32_t)a.data[i] + (uint32_t)b.data[i] + carry;
-        result.data[i] = sum & 0xFF;
-        carry = sum >> 8;
-    }
-
-    // Saturate on overflow
-    if (carry != 0) {
-        memset(result.data, 0xFF, 32);
-    }
-
-    return result;
+    return dilithion::consensus::AddChainWork(a, b);
 }
 
 bool HeadersSyncState::ChainWorkGreaterOrEqual(const uint256& a, const uint256& b) const {

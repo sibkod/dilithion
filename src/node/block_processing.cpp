@@ -8,7 +8,7 @@
 #include <node/block_index.h>
 #include <node/block_validation_queue.h>
 #include <node/fork_manager.h>
-#include <node/ibd_coordinator.h>
+#include <net/port/sync_coordinator.h>  // Phase 6 PR6.5a: routes via ISyncCoordinator
 #include <node/utxo_set.h>
 #include <consensus/chain.h>
 #include <consensus/pow.h>
@@ -409,8 +409,8 @@ BlockProcessResult ProcessNewBlock(
             // the network. The ban list includes DilV Sybil MIKs that may overlap
             // with legitimate DIL miners (shared ban list, separate chains).
             // Bans are node policy (NOT consensus) per line 206.
-            bool is_ibd = g_node_context.ibd_coordinator &&
-                          !g_node_context.ibd_coordinator->IsSynced();
+            bool is_ibd = g_node_context.sync_coordinator &&
+                          !g_node_context.sync_coordinator->IsSynced();
             if (!skipPoWCheck && !is_ibd && g_bannedMIKs.IsBanned(blockMikHex)) {
                 if (g_verbose.load(std::memory_order_relaxed))
                     std::cout << "[ProcessNewBlock] REJECTED: banned MIK " << blockMikHex.substr(0, 12) << "..." << std::endl;
@@ -1038,8 +1038,8 @@ BlockProcessResult ProcessNewBlock(
                     }
                 }
                 // Notify IBD coordinator of orphan block for Layer 2 fork detection
-                if (g_node_context.ibd_coordinator) {
-                    g_node_context.ibd_coordinator->OnOrphanBlockReceived();
+                if (g_node_context.sync_coordinator) {
+                    g_node_context.sync_coordinator->OnOrphanBlockReceived();
                 }
                 // ROOT CAUSE FIX: Mark height completed to prevent re-request loop.
                 // Without this, MarkBlockReceived (line 559) clears the tracker entry,
@@ -1076,7 +1076,13 @@ BlockProcessResult ProcessNewBlock(
     // =========================================================================
     auto pblockIndex = std::make_unique<CBlockIndex>(block);
     pblockIndex->phashBlock = blockHash;
-    pblockIndex->nStatus = CBlockIndex::BLOCK_HAVE_DATA;
+    // v4.3.3 F14 (Layer-3 round 2 LOW-2): canonical block-receipt
+    // flag-setter. Combines the F1 BLOCK_HAVE_DATA OR-merge with the F7
+    // BLOCK_VALID_TRANSACTIONS validity-raise into ONE op. Mirrors
+    // upstream Bitcoin Core's ReceivedBlockTransactions invariant
+    // (validation.cpp:3774,3778). DO NOT split this back into open-coded
+    // F1+F7 — the helper is the canonical contract.
+    pblockIndex->MarkBlockReceived();
 
 
 
@@ -1192,8 +1198,8 @@ BlockProcessResult ProcessNewBlock(
                     // BUG #261 FIX: Only signal fork if node is synced
                     // During startup, blocks can arrive with "unknown" parents due to timing.
                     // This is normal startup behavior, not a real fork.
-                    bool is_synced = g_node_context.ibd_coordinator &&
-                                     g_node_context.ibd_coordinator->IsSynced();
+                    bool is_synced = g_node_context.sync_coordinator &&
+                                     g_node_context.sync_coordinator->IsSynced();
                     if (is_synced) {
                         g_node_context.fork_detected.store(true);
                         g_metrics.SetForkDetected(true, 0, 0);
@@ -1253,8 +1259,8 @@ BlockProcessResult ProcessNewBlock(
         }
 
         // Notify IBD coordinator of orphan block for Layer 2 fork detection
-        if (g_node_context.ibd_coordinator) {
-            g_node_context.ibd_coordinator->OnOrphanBlockReceived();
+        if (g_node_context.sync_coordinator) {
+            g_node_context.sync_coordinator->OnOrphanBlockReceived();
         }
 
         return BlockProcessResult::ORPHAN;
@@ -1464,8 +1470,8 @@ BlockProcessResult ProcessNewBlock(
 
         // A1 FIX: Notify IBD coordinator that a block connected successfully
         // Resets orphan streak counter (Layer 2 fork detection) and updates block-flow timestamp
-        if (g_node_context.ibd_coordinator) {
-            g_node_context.ibd_coordinator->OnBlockConnected();
+        if (g_node_context.sync_coordinator) {
+            g_node_context.sync_coordinator->OnBlockConnected();
         }
 
         if (reorgOccurred) {

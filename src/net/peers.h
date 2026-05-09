@@ -5,9 +5,12 @@
 #define DILITHION_NET_PEERS_H
 
 #include <net/protocol.h>
-#include <net/addrman.h>  // Bitcoin Core-style address manager
+#include <net/iaddress_manager.h>  // Phase 1 port: IAddressManager interface
+#include <net/ipeer_scorer.h>      // Phase 2 port: IPeerScorer interface
+#include <net/port/maybe_punish_node.h>  // Phase 3: HeaderRejectReason enum
 #include <net/banman.h>   // Bitcoin Core-style ban manager with persistence
 #include <net/peer_discovery.h>  // Network: Enhanced peer discovery
+#include <net/bandwidth_throttle.h>   // F21: per-peer throttle cleanup on disconnect
 #include <net/connection_quality.h>  // Network: Connection quality metrics
 #include <net/socket.h>   // Phase 2: Socket in CPeer
 #include <net/node_state.h>  // Phase 3: For QueuedBlock
@@ -59,7 +62,9 @@ public:
     bool relay;                      // Whether peer relays transactions
 
     // DoS protection
-    int misbehavior_score;           // Accumulated misbehavior points
+    // Phase 2 port: misbehavior_score field DELETED (Q3=B). Score lives in
+    // CPeerScorer (CPeerManager::m_scorer) keyed by peer id; query via
+    // CPeerManager::GetMisbehaviorScore(peer_id).
     int64_t ban_time;                // Time when ban expires (0 = not banned)
 
     // === Phase 2: Socket moved from CConnectionManager to CPeer ===
@@ -132,7 +137,7 @@ public:
     CPeer()
         : id(0), state(STATE_DISCONNECTED), connect_time(0),
           last_recv(0), last_send(0), version(0), start_height(0),
-          best_known_height(0), relay(true), misbehavior_score(0), ban_time(0),
+          best_known_height(0), relay(true), ban_time(0),
           m_stalling_since(std::chrono::steady_clock::now()),
           m_downloading_since(std::chrono::steady_clock::now()),
           m_last_block_announcement(std::chrono::steady_clock::now()),
@@ -143,7 +148,7 @@ public:
         : id(id_in), addr(addr_in), state(STATE_DISCONNECTED),
           connect_time(GetTime()), last_recv(0), last_send(0),
           version(0), start_height(0), best_known_height(0), relay(true),
-          misbehavior_score(0), ban_time(0),
+          ban_time(0),
           m_stalling_since(std::chrono::steady_clock::now()),
           m_downloading_since(std::chrono::steady_clock::now()),
           m_last_block_announcement(std::chrono::steady_clock::now()),
@@ -188,7 +193,8 @@ public:
         return state == STATE_BANNED || (ban_time > 0 && GetTime() < ban_time);
     }
 
-    bool Misbehaving(int howmuch);
+    // Phase 2 port: CPeer::Misbehaving DELETED. Use
+    // CPeerManager::Misbehaving(peer_id, ...) which routes through CPeerScorer.
     void Ban(int64_t ban_until);
     void Disconnect();
     std::string ToString() const;
@@ -226,10 +232,20 @@ private:
     // Hardcoded seed nodes
     std::vector<NetProtocol::CAddress> seed_nodes;
 
-    // Bitcoin Core-style address manager (replaces simple addr_map)
-    // Provides eclipse attack protection via two-table bucket system
-    CAddrMan addrman;
+    // Phase 1 port: IAddressManager interface owns either CAddrMan_v2 (default
+    // production path; new bucket-secret + tried/new tables) or
+    // LegacyAddrManAdapter (operator escape hatch via DILITHION_USE_ADDRMAN_V2=0).
+    // Either implementation handles eclipse attack protection via the same
+    // two-table bucket invariant.
+    std::unique_ptr<::dilithion::net::IAddressManager> addrman;
     std::string data_dir;  // Path to data directory for peers.dat
+
+    // Phase 2 port: misbehavior scoring lives behind the IPeerScorer interface.
+    // Default: CPeerScorer (operator can opt out via DILITHION_USE_NEW_PEER_SCORER=0,
+    // in which case m_scorer stays null and Misbehaving becomes a tracking-
+    // disabled no-op — manual ban via RPC still works, peer-protocol-level
+    // disconnects still fire). See port_phase_2_implementation_plan.md §10.
+    std::unique_ptr<::dilithion::net::IPeerScorer> m_scorer;
     
     // Network: Enhanced peer discovery
     std::unique_ptr<CPeerDiscovery> peer_discovery;
@@ -237,12 +253,29 @@ private:
     // Network: Connection quality tracking
     CConnectionQualityTracker connection_quality;
 
-    // Connection limits
+    // F21 (v4.3.3 Track B): single throttle table for future send/recv hooks;
+    // RemovePeer on disconnect prevents map growth once RecordTransfer is wired.
+    //
+    // F24 SSOT contract (v4.3.4 cut Block 10): this field is the SINGLE
+    // source of truth for per-peer bandwidth throttling state. The API is
+    // defined in <net/bandwidth_throttle.h> (CPerPeerThrottle::RecordTransfer,
+    // CheckLimits, RemovePeer, etc.). Future maintainers adding rate-limit
+    // logic should extend CPerPeerThrottle's interface and consult this
+    // single instance — do NOT introduce a parallel per-peer throttle map
+    // elsewhere. Any future code path that needs throttling state for a peer
+    // queries this field via CPeerManager (legacy peer manager owns the
+    // singleton). Lifetime: same as legacy CPeerManager (NodeContext::peer_manager).
+    CPerPeerThrottle m_peer_bandwidth_throttle;
+
+public:
+    // Connection limits — public so CPeerScorer (and any future
+    // peer-bookkeeping component) can size data structures against the
+    // node-wide cap. Moved from private->public per Cursor Phase 2 review
+    // Q9 (2026-04-26).
     static const int MAX_OUTBOUND_CONNECTIONS = 8;
     static const int MAX_INBOUND_CONNECTIONS = 117;
     static const int MAX_TOTAL_CONNECTIONS = 125;
 
-public:
     // DoS protection thresholds (public so CPeer can access)
     static const int BAN_THRESHOLD = 100;
     static const int64_t DEFAULT_BAN_TIME = 1 * 60 * 60;  // 1 hour (temporary during DFMP transition)
@@ -262,6 +295,50 @@ public:
     std::shared_ptr<CPeer> GetPeer(int peer_id);
     std::vector<std::shared_ptr<CPeer>> GetAllPeers();
     std::vector<std::shared_ptr<CPeer>> GetConnectedPeers();
+
+    /**
+     * @brief Phase 10 PR10.2 — atomic joint snapshot of connected peers
+     *        with their per-peer block-download counts.
+     *
+     * Eliminates the Phase 9 PR9.6-RT-MEDIUM-2 (b) peer-disconnect-during-
+     * iteration race in `RPC_GetBlockDownloadStats`. The race fires when
+     * `GetConnectedPeers()` snapshots one set of peers, then iterating
+     * `block_tracker->GetPeerInFlightCount(id)` per peer happens after
+     * cs_peers has been released — peer events between the snapshot and
+     * the per-peer reads can introduce inconsistency.
+     *
+     * This getter holds cs_peers throughout the iteration AND calls
+     * `g_node_context.block_tracker->GetPeerInFlightCount(id)` inside
+     * the locked region — producing a joint atomic snapshot.
+     *
+     * **Lock-ordering safety (audited PR10.2 2026-05-01; refined per
+     * Layer-2 PR10.2-RT-LOW-1; line numbers corrected per Layer-2
+     * PR10.6-RT-LOW-1):** the established Dilithion order is
+     * `cs_peers → block_tracker.m_mutex` at TWO genuinely-nested
+     * precedent sites (`MarkBlockAsInFlight` defined at peers.cpp:1085,
+     * `GetBlocksInFlightForPeer` defined at peers.cpp:1242).
+     * `OnPeerDisconnected` is sequential, not nested, so it is not a
+     * precedent for this pattern.
+     *
+     * The inverse order is structurally impossible per block_tracker's
+     * encapsulation invariant: `CBlockTracker` only acquires `m_mutex`
+     * internally and never calls into CPeerManager from inside the
+     * locked region (verified: read every public method on
+     * `block_tracker.h`). No path can hold `block_tracker.m_mutex` and
+     * then attempt `cs_peers`. Future maintainers adding peer-event
+     * callbacks INTO block_tracker would silently break this safety
+     * claim — see the invariant comment near
+     * `CBlockTracker::m_mutex` declaration.
+     *
+     * @return Vector of (peer_id, blocks_in_flight) pairs for all
+     *         connected peers; empty if g_node_context.block_tracker
+     *         is null.
+     */
+    struct BlockDownloadEntry {
+        int peer_id;
+        int blocks_in_flight;
+    };
+    std::vector<BlockDownloadEntry> GetBlockDownloadSnapshot() const;
 
     // Phase 1: CNode management (event-driven networking)
     // CNode objects are owned by CConnman. These methods manage references only.
@@ -294,6 +371,31 @@ public:
     // DoS protection with structured misbehavior tracking
     void Misbehaving(int peer_id, int howmuch, MisbehaviorType type = MisbehaviorType::NONE);
     void DecayMisbehaviorScores();  // BUG #49: Decay scores over time
+
+    // Phase 2 port: cumulative misbehavior score for a peer. Returns 0 if the
+    // peer has no recorded misbehavior or if the scorer is disabled
+    // (DILITHION_USE_NEW_PEER_SCORER=0). Replaces direct reads of the deleted
+    // CPeer::misbehavior_score field at all call sites.
+    int GetMisbehaviorScore(int peer_id) const;
+
+    // Phase 3: typed-reason variant of Misbehaving for HeadersSync-layer
+    // call sites. Resolves the weight via maybe_punish_node.h's wrappers
+    // (DefaultWeight + Q6=B override for REDOWNLOAD commitment mismatch),
+    // then forwards to the existing Misbehaving forwarder (so seed-node
+    // protection, banman.Ban, AddrMan signal all still fire). Wires the
+    // Phase 3 MaybePunishNodeForHeaders wrapper into the production path.
+    void MisbehaveHeaders(
+        int peer_id,
+        ::dilithion::net::port::HeaderRejectReason reason);
+
+    // Phase 2.5 ticket PHASE-2.5-ADDRMAN-BIAS: test-only accessor for the
+    // owned addrman, used by integration tests that need to observe AddrMan
+    // state changes from forwarder calls (e.g. RecordAttempt(PeerMisbehaved)
+    // wire-up). Returns the underlying IAddressManager*; cast to concrete
+    // type via dynamic_cast for impl-specific *ForTest diagnostics.
+    ::dilithion::net::IAddressManager* GetAddrManagerForTest() const {
+        return addrman.get();
+    }
 
     // Access to ban manager for advanced operations
     CBanManager& GetBanManager() { return banman; }

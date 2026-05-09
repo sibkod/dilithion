@@ -51,7 +51,7 @@
 #include <amount.h>
 #include <net/peers.h>  // For CPeerManager
 #include <core/node_context.h>  // For g_node_context
-#include <node/ibd_coordinator.h>  // For CIbdCoordinator::IsInitialBlockDownload
+#include <net/port/sync_coordinator.h>  // Phase 6 PR6.5a: IsInitialBlockDownload via adapter
 #include <node/peer_mik_tracker.h>  // Sybil defense Phase 1
 #include <vdf/cooldown_tracker.h>   // Sybil defense Phase 4
 #include <net/net.h>  // For CNetMessageProcessor and other networking types
@@ -252,6 +252,9 @@ CRPCServer::CRPCServer(uint16_t port)
     // Network and general
     m_handlers["getnetworkinfo"] = [this](const std::string& p) { return RPC_GetNetworkInfo(p); };
     m_handlers["getpeerinfo"] = [this](const std::string& p) { return RPC_GetPeerInfo(p); };
+    // Phase 9 PR9.3: --usenewpeerman burn-in telemetry (read-only views).
+    m_handlers["getsyncstatus"] = [this](const std::string& p) { return RPC_GetSyncStatus(p); };
+    m_handlers["getblockdownloadstats"] = [this](const std::string& p) { return RPC_GetBlockDownloadStats(p); };
     m_handlers["getconnectioncount"] = [this](const std::string& p) { return RPC_GetConnectionCount(p); };
     m_handlers["help"] = [this](const std::string& p) { return RPC_Help(p); };
     m_handlers["stop"] = [this](const std::string& p) { return RPC_Stop(p); };
@@ -4564,8 +4567,8 @@ std::string CRPCServer::RPC_StartMining(const std::string& params) {
         }
 
         // BUG FIX: Prevent mining during IBD (Initial Block Download)
-        if (g_node_context.ibd_coordinator &&
-            g_node_context.ibd_coordinator->IsInitialBlockDownload()) {
+        if (g_node_context.sync_coordinator &&
+            g_node_context.sync_coordinator->IsInitialBlockDownload()) {
             g_node_state.mining_enabled = true;
             throw std::runtime_error("Node is still syncing (Initial Block Download). Mining will start automatically once sync completes.");
         }
@@ -4618,8 +4621,8 @@ std::string CRPCServer::RPC_StartMining(const std::string& params) {
     }
 
     // Prevent mining during IBD (same fix as VDF path above)
-    if (g_node_context.ibd_coordinator &&
-        g_node_context.ibd_coordinator->IsInitialBlockDownload()) {
+    if (g_node_context.sync_coordinator &&
+        g_node_context.sync_coordinator->IsInitialBlockDownload()) {
         g_node_state.mining_enabled = true;
         throw std::runtime_error("Node is still syncing (Initial Block Download). Mining will start automatically once sync completes.");
     }
@@ -5162,6 +5165,26 @@ std::string CRPCServer::RPC_GetFullMIKDistribution(const std::string& params) {
     }
 
     int currentHeight = static_cast<int>(m_chainstate->GetHeight());
+
+    // v4.1: optional `maxHeight` parameter caps the scan. Used by the
+    // two-pass build procedure to capture the canonical lifetime miner
+    // count at h=44232 for embedding in chainparams. Backward-compatible:
+    // no params (or invalid params) → scan to current tip = legacy behavior.
+    int maxHeight = currentHeight;
+    if (!params.empty()) {
+        try {
+            nlohmann::json p = nlohmann::json::parse(params);
+            if (p.is_object() && p.contains("maxHeight")) {
+                int requested = p.at("maxHeight").get<int>();
+                if (requested > 0 && requested <= currentHeight) {
+                    maxHeight = requested;
+                }
+            }
+        } catch (...) {
+            // Fall back to current tip on any parse error
+        }
+    }
+
     std::map<std::string, int> mikBlockCounts;  // MIK identity hex -> block count
     std::map<std::string, std::set<std::string>> mikAddresses;  // MIK hex -> set of payout addresses
     int blocksWithMIK = 0;
@@ -5169,7 +5192,7 @@ std::string CRPCServer::RPC_GetFullMIKDistribution(const std::string& params) {
 
     CBlockValidator validator;
 
-    for (int height = 1; height <= currentHeight; height++) {
+    for (int height = 1; height <= maxHeight; height++) {
         // Get block hash for this height using chainstate
         std::vector<uint256> hashes = m_chainstate->GetBlocksAtHeight(height);
         if (hashes.empty()) continue;
@@ -5224,6 +5247,11 @@ std::string CRPCServer::RPC_GetFullMIKDistribution(const std::string& params) {
     std::ostringstream oss;
     oss << "{";
     oss << "\"total_blocks\":" << currentHeight << ",";
+    // v4.1: additive field — scan depth used for this query. Equal to
+    // total_blocks when no maxHeight param was provided. Cursor F5 fix:
+    // backward-compatible with existing callers (additive, semantics of
+    // total_blocks unchanged).
+    oss << "\"scanned_through_height\":" << maxHeight << ",";
     oss << "\"blocks_with_mik\":" << blocksWithMIK << ",";
     oss << "\"blocks_without_mik\":" << blocksWithoutMIK << ",";
     oss << "\"unique_miners\":" << mikBlockCounts.size() << ",";
@@ -5233,7 +5261,8 @@ std::string CRPCServer::RPC_GetFullMIKDistribution(const std::string& params) {
     for (const auto& [mikHex, blockCount] : sorted) {
         if (!first) oss << ",";
         first = false;
-        double percentage = (currentHeight > 0) ? (blockCount * 100.0 / currentHeight) : 0;
+        // v4.1: use scanned scope (maxHeight) for percentage when bounded
+        double percentage = (maxHeight > 0) ? (blockCount * 100.0 / maxHeight) : 0;
         oss << "{\"mik\":\"" << mikHex << "\",\"blocks\":" << blockCount
             << ",\"percent\":" << std::fixed << std::setprecision(2) << percentage;
 
@@ -5280,6 +5309,8 @@ std::string CRPCServer::RPC_GetPeerInfo(const std::string& params) {
     // Get all connected peers
     auto peers = g_node_context.peer_manager->GetConnectedPeers();
 
+    const char* manager_class = "legacy";
+
     std::ostringstream oss;
     oss << "[";
 
@@ -5319,7 +5350,11 @@ std::string CRPCServer::RPC_GetPeerInfo(const std::string& params) {
         oss << "\"subver\":\"" << EscapeJSON(peer->user_agent) << "\",";
         oss << "\"startingheight\":" << peer->start_height << ",";
         oss << "\"relaytxes\":" << (peer->relay ? "true" : "false") << ",";
-        oss << "\"misbehavior\":" << peer->misbehavior_score;
+        // Phase 2 port: misbehavior score moved into CPeerScorer; query via
+        // the manager's accessor.
+        oss << "\"misbehavior\":" << g_node_context.peer_manager->GetMisbehaviorScore(peer->id) << ",";
+        // Phase 9 PR9.3: additive field preserved for monitoring compatibility.
+        oss << "\"manager_class\":\"" << manager_class << "\"";
         oss << "}";
     }
 
@@ -5339,6 +5374,103 @@ std::string CRPCServer::RPC_GetConnectionCount(const std::string& params) {
 
     size_t count = g_node_context.peer_manager->GetConnectionCount();
     return std::to_string(count);
+}
+
+// ============================================================================
+// Phase 9 PR9.3: --usenewpeerman burn-in telemetry RPCs
+// ============================================================================
+//
+// Schemas locked in port_phase_9_implementation_plan.md v0.1.2 §PR9.3.
+// Read-only views of existing CHeadersManager + CBlockFetcher + CConnman
+// state — no new tracking infrastructure, no new locking surface.
+//
+// Permission tier: readBlockchain (same as getpeerinfo / getblockchaininfo).
+// ============================================================================
+
+std::string CRPCServer::RPC_GetSyncStatus(const std::string& params) {
+    extern NodeContext g_node_context;
+    if (!g_node_context.headers_manager) {
+        return "{\"error\":\"headers_manager not initialized\"}";
+    }
+
+    // Phase 10 PR10.2: switched from three independent getter calls to
+    // CHeadersManager::GetSyncSnapshot() — single cs_headers acquisition
+    // returning all three values atomically. Eliminates the Phase 9
+    // PR9.6-RT-MEDIUM-2 (a) multi-lock tip-skew race window where a
+    // header arriving between GetSyncProgress / GetBestHeight /
+    // GetBestHeaderHash calls left height + hash referring to different
+    // blocks. The snapshot is internally consistent by construction.
+    auto snap = g_node_context.headers_manager->GetSyncSnapshot();
+
+    const char* manager_class = "legacy";
+
+    std::ostringstream oss;
+    oss << "{";
+    oss << "\"headers_progress\":" << snap.progress << ",";
+    oss << "\"best_header_height\":" << snap.best_height << ",";
+    oss << "\"best_header_hash\":\"" << snap.best_hash.GetHex() << "\",";
+    oss << "\"manager_class\":\"" << manager_class << "\"";
+    oss << "}";
+    return oss.str();
+}
+
+std::string CRPCServer::RPC_GetBlockDownloadStats(const std::string& params) {
+    extern NodeContext g_node_context;
+    if (!g_node_context.block_fetcher) {
+        return "{\"error\":\"block_fetcher not initialized\"}";
+    }
+
+    const char* manager_class = "legacy";
+
+    size_t total_in_flight = g_node_context.block_fetcher->GetInFlightCount();
+    size_t total_pending = g_node_context.block_fetcher->GetPendingCount();
+
+    // Phase 10 PR10.2: switched from "GetConnectedPeers + per-peer
+    // GetPeerBlocksInFlight" to CPeerManager::GetBlockDownloadSnapshot()
+    // — single cs_peers acquisition with nested block_tracker reads.
+    // Eliminates Phase 9 PR9.6-RT-MEDIUM-2 (b) peer-disconnect-during-
+    // iteration race. Lock-ordering audit (PR10.2 2026-05-01) confirmed
+    // cs_peers → block_tracker is the established Dilithion order;
+    // joint snapshot follows it. No deadlock potential.
+    std::ostringstream oss;
+    oss << "{";
+    oss << "\"total_blocks_in_flight\":" << total_in_flight << ",";
+    oss << "\"total_blocks_pending\":" << total_pending << ",";
+    oss << "\"peers\":[";
+
+    if (g_node_context.peer_manager) {
+        auto snapshot = g_node_context.peer_manager->GetBlockDownloadSnapshot();
+        bool first = true;
+        for (const auto& entry : snapshot) {
+            if (!first) oss << ",";
+            first = false;
+            oss << "{";
+            oss << "\"peer_id\":" << entry.peer_id << ",";
+            oss << "\"blocks_in_flight\":" << entry.blocks_in_flight << ",";
+            oss << "\"manager_class\":\"" << manager_class << "\"";
+            oss << "}";
+        }
+    }
+    oss << "],";
+
+    // Stalled blocks via existing GetStalledBlocks(60s) — non-mutating read.
+    // (PR9.6-RT-MEDIUM-3 correction: an earlier draft of this comment claimed
+    // CheckTimeouts mutates internal state. It does not — block_tracker.h:267
+    // declares CheckTimeouts() const; it iterates m_heights and returns
+    // entries past the timeout without modifying any state.)
+    oss << "\"stalled_blocks\":[";
+    {
+        auto stalled = g_node_context.block_fetcher->GetStalledBlocks(std::chrono::seconds(60));
+        bool first = true;
+        for (const auto& [height, peer_id] : stalled) {
+            if (!first) oss << ",";
+            first = false;
+            oss << "{\"height\":" << height << ",\"peer_id\":" << peer_id << "}";
+        }
+    }
+    oss << "]";
+    oss << "}";
+    return oss.str();
 }
 
 std::string CRPCServer::RPC_Help(const std::string& params) {
@@ -7418,7 +7550,7 @@ std::string CRPCServer::RPC_InvalidateBlock(const std::string& params) {
             g_node_context.block_tracker->ClearAboveHeight(disconnectTo);
 
         // Reset fork detection state so IBD can re-sync
-        if (g_node_context.ibd_coordinator) {
+        if (g_node_context.sync_coordinator) {
             g_node_context.fork_detected.store(false);
         }
 
@@ -7468,7 +7600,7 @@ std::string CRPCServer::RPC_InvalidateBlock(const std::string& params) {
     if (g_node_context.block_tracker)
         g_node_context.block_tracker->ClearAboveHeight(disconnectTo);
 
-    if (g_node_context.ibd_coordinator) {
+    if (g_node_context.sync_coordinator) {
         g_node_context.fork_detected.store(false);
     }
 
@@ -7488,7 +7620,7 @@ std::string CRPCServer::RPC_ReconsiderBlock(const std::string& params) {
     g_node_context.fork_detected.store(false);
 
     // Reset IBD coordinator fork state
-    if (g_node_context.ibd_coordinator) {
+    if (g_node_context.sync_coordinator) {
         // Trigger fresh fork detection by clearing the detected flag
         std::cout << "[RPC] reconsiderblock: clearing fork detection state" << std::endl;
     }
@@ -8690,8 +8822,20 @@ std::string CRPCServer::RPC_GetMIKAttestation(const std::string& params) {
             state.newMIKsToday = 0;
         }
 
-        // Check if this MIK has been attested before from this subnet
-        bool isRenewal = (state.knownMIKs.find(mikIdHex) != state.knownMIKs.end());
+        // The chain is the source of truth for "is this a known MIK." In-memory
+        // state.knownMIKs is just a per-/24 cross-restart cache and was the only
+        // signal until the 2026-05-03 outage exposed two failure modes:
+        //   (a) seed restarts wipe the map — returning miners look "new"
+        //   (b) miners on dynamic-IP carriers (PLDT, IIJ, etc.) appear from a
+        //       different /24 each session and bypass the cache hit
+        // Both are rate-limited even though their MIK is permanently registered
+        // on-chain. Consult the chain first; the in-memory map is the fallback.
+        std::array<uint8_t, 20> mikArr;
+        std::copy(mikIdentity.data, mikIdentity.data + 20, mikArr.begin());
+        bool isOnChain = g_node_context.mik_pubkey_cache &&
+                         g_node_context.mik_pubkey_cache->DbStillHasMIK(mikArr);
+        bool isRenewal = isOnChain ||
+                         (state.knownMIKs.find(mikIdHex) != state.knownMIKs.end());
 
         if (!isRenewal) {
             // New MIK for this subnet — apply rate limit
@@ -8709,7 +8853,8 @@ std::string CRPCServer::RPC_GetMIKAttestation(const std::string& params) {
                       << " today, limit: " << m_attestationMaxPerDay << ")" << std::endl;
         } else {
             std::cout << "[Attestation] Renewal for known MIK " << mikIdHex.substr(0, 12) << "..."
-                      << " from subnet " << subnetKey << ".* (bypassing rate limit)" << std::endl;
+                      << " from subnet " << subnetKey << ".* (bypassing rate limit, source="
+                      << (isOnChain ? "chain" : "cache") << ")" << std::endl;
         }
 
         // Record this MIK as known for this subnet

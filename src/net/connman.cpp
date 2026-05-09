@@ -13,6 +13,7 @@
 #include <net/protocol.h>
 #include <net/serialize.h>
 #include <net/banman.h>  // For MisbehaviorType
+#include <core/chainparams.h>  // Phase 4: per-chain outbound class targets
 #include <util/time.h>
 #include <util/logging.h>
 #include <util/strencodings.h>  // For strprintf
@@ -53,6 +54,20 @@ static std::atomic<int> g_blocks_worker_received{0};  // Step 5: Popped by Block
 static std::atomic<int> g_blocks_processed{0};        // Step 6: ProcessQueuedMessage returned
 
 CConnman::CConnman() = default;
+
+bool CConnman::DispatchPeerConnected(int node_id, CNode* pnode,
+                                     const NetProtocol::CAddress& addr, bool inbound)
+{
+    if (!m_peer_manager) return true;  // tolerated null in tests
+    return m_peer_manager->RegisterNode(node_id, pnode, addr, inbound);
+}
+
+void CConnman::DispatchPeerDisconnected(int node_id)
+{
+    if (m_peer_manager) {
+        m_peer_manager->OnPeerDisconnected(node_id);
+    }
+}
 
 CConnman::~CConnman() {
     Interrupt();
@@ -285,7 +300,8 @@ void CConnman::Interrupt() {
     m_blocks_cv.notify_all();
 }
 
-CNode* CConnman::ConnectNode(const NetProtocol::CAddress& addr, bool manual) {
+CNode* CConnman::ConnectNode(const NetProtocol::CAddress& addr, bool manual,
+                             CNode::OutboundClass cls) {
     // Phase 2: Implement outbound connection
 
     // Extract IP string from address (supports both IPv4 and IPv6)
@@ -376,8 +392,19 @@ CNode* CConnman::ConnectNode(const NetProtocol::CAddress& addr, bool manual) {
             }
         }
         if (outbound_count >= static_cast<size_t>(m_options.nMaxOutbound)) {
-            LogPrintf(NET, WARN, "[CConnman] Outbound connection limit reached (%zu/%d)\n",
-                      outbound_count, m_options.nMaxOutbound);
+            // v4.2.0 — throttle this WARN to once per 60s. At-limit is a
+            // persistent steady state on a healthy mesh (every retry by
+            // the connection scheduler hits this branch), so without the
+            // throttle the log floods. CAS so concurrent rejected
+            // attempts only emit one line.
+            const int64_t now = GetTime();
+            int64_t last = m_outbound_limit_log_last.load();
+            if (now - last >= OUTBOUND_LIMIT_LOG_INTERVAL_SECONDS &&
+                m_outbound_limit_log_last.compare_exchange_strong(last, now)) {
+                LogPrintf(NET, WARN, "[CConnman] Outbound connection limit reached (%zu/%d) — suppressing further at-limit warnings for %lds\n",
+                          outbound_count, m_options.nMaxOutbound,
+                          static_cast<long>(OUTBOUND_LIMIT_LOG_INTERVAL_SECONDS));
+            }
             CSock::Close(sock);
             return nullptr;
         }
@@ -387,11 +414,15 @@ CNode* CConnman::ConnectNode(const NetProtocol::CAddress& addr, bool manual) {
         auto node = std::make_unique<CNode>(node_id, addr, false);  // false = outbound
         CNode* pnode = node.get();
         pnode->fManual = manual;
+        // Phase 4 port: tag the connection class so per-class accounting
+        // and per-class behaviour gating (no-tx-relay for BlockRelay etc.)
+        // can dispatch on m_outbound_class.
+        pnode->m_outbound_class = manual ? CNode::OutboundClass::Manual : cls;
 
         pnode->SetSocket(static_cast<int>(sock));
         pnode->state.store(CNode::STATE_CONNECTING);
 
-        if (!m_peer_manager->RegisterNode(node_id, pnode, addr, false)) {
+        if (!DispatchPeerConnected(node_id, pnode, addr, false)) {
             LogPrintf(NET, WARN, "[CConnman] Not connecting to banned IP %s\n", ip_str.c_str());
             // node destructor closes socket
             return nullptr;
@@ -527,7 +558,7 @@ bool CConnman::AcceptConnection(std::unique_ptr<CSocket> socket, const NetProtoc
         std::lock_guard<std::mutex> lock(cs_vNodes);
         // FIX: Register BEFORE adding to m_nodes to prevent race condition
         // BUG #148 ROOT CAUSE FIX: Check return value (banned IP check)
-        if (!m_peer_manager->RegisterNode(node_id, pnode, addr, true)) {
+        if (!DispatchPeerConnected(node_id, pnode, addr, true)) {
             LogPrintf(NET, WARN, "[CConnman] Rejecting banned inbound from %s\n", ip_str.c_str());
             // node destructor closes socket
             return false;
@@ -795,9 +826,12 @@ bool CConnman::ProcessQueuedMessage(const QueuedMessage& msg) {
     // Handle misbehavior tracking on failure
     if (!success && m_peer_manager) {
         auto peer = m_peer_manager->GetPeer(msg.node_id);
-        if (peer && peer->misbehavior_score > 100) {
+        // Phase 2 port: misbehavior_score moved into CPeerScorer; query via
+        // the manager's accessor.
+        const int score = m_peer_manager->GetMisbehaviorScore(msg.node_id);
+        if (peer && score > 100) {
             LogPrintf(NET, INFO, "[CConnman] Disconnecting node %d due to misbehavior (score: %d)\n",
-                      msg.node_id, peer->misbehavior_score);
+                      msg.node_id, score);
             std::lock_guard<std::mutex> lock(cs_vNodes);
             for (auto& node : m_nodes) {
                 if (node->id == msg.node_id) {
@@ -939,8 +973,14 @@ void CConnman::RemoveManualNode(const std::string& ip_str) {
 void CConnman::ThreadOpenConnections() {
     LogPrintf(NET, INFO, "[CConnman] ThreadOpenConnections started\n");
 
-    // AGGRESSIVE connection settings
-    constexpr size_t TARGET_OUTBOUND = 8;
+    // Phase 4 port: per-class outbound targets, sourced from chainparams.
+    //   FullRelay   — default (Bitcoin's 8 for both chains)
+    //   BlockRelay  — DilV 4, DIL 2 (plan §10 Q4 — DilV's 45s blocks
+    //                 benefit from faster propagation)
+    const size_t TARGET_FULL_RELAY = (Dilithion::g_chainParams != nullptr)
+        ? static_cast<size_t>(Dilithion::g_chainParams->nOutboundFullRelayTarget) : 8;
+    const size_t TARGET_BLOCK_RELAY = (Dilithion::g_chainParams != nullptr)
+        ? static_cast<size_t>(Dilithion::g_chainParams->nOutboundBlockRelayTarget) : 2;
     constexpr int CONNECTION_INTERVAL_SECONDS = 10;  // Check every 10 seconds (was 60)
 
     while (!interruptNet.load()) {
@@ -1001,54 +1041,62 @@ void CConnman::ThreadOpenConnections() {
             }
         }
 
-        // PHASE 2: Fill remaining slots from AddrMan
-        size_t outbound_count = m_peer_manager->GetOutboundCount();
-        if (outbound_count < TARGET_OUTBOUND) {
-            size_t needed = TARGET_OUTBOUND - outbound_count;
-
-            // Get addresses from AddrMan
-            auto addrs = m_peer_manager->SelectAddressesToConnect(static_cast<int>(needed * 3));
-
-            size_t connections_made = 0;
-            for (const auto& addr : addrs) {
-                if (connections_made >= needed) {
-                    break;
+        // PHASE 2: Per-class outbound fill (Phase 4 port).
+        // Count current outbound by class, then fill FullRelay slots first
+        // (chain-of-blocks sync priority), then BlockRelay slots (anti-
+        // eclipse). Both classes draw from AddrMan via the same
+        // SelectAddressesToConnect path; the class is set on the resulting
+        // CNode at construction.
+        size_t full_relay_count = 0;
+        size_t block_relay_count = 0;
+        {
+            std::lock_guard<std::mutex> lock(cs_vNodes);
+            for (const auto& node : m_nodes) {
+                if (!node || node->fInbound || node->fDisconnect.load()) continue;
+                if (node->fManual) continue;  // Manual is its own bucket
+                switch (node->m_outbound_class) {
+                    case CNode::OutboundClass::FullRelay:  ++full_relay_count;  break;
+                    case CNode::OutboundClass::BlockRelay: ++block_relay_count; break;
+                    default: break;
                 }
-
-                std::string ip_str = addr.ToStringIP();
-
-                // Skip already connected (including seeds we just connected)
-                if (connected_ips.count(ip_str)) {
-                    continue;
-                }
-
-                // Skip non-routable
-                if (!addr.IsRoutable()) {
-                    continue;
-                }
-
-                // Mark as tried before attempting
-                m_peer_manager->MarkAddressTried(addr);
-
-                // Attempt connection
-                CNode* pnode = ConnectNode(addr);
-                if (pnode) {
-                    LogPrintf(NET, INFO, "[CConnman] ThreadOpenConnections: connected to %s (node %d)\n",
-                              ip_str.c_str(), pnode->id);
-                    connections_made++;
-                    connected_ips.insert(std::move(ip_str));  // Move instead of copy (perf fix)
-                    // NOTE: Do NOT call MarkAddressGood here!
-                    // ConnectNode only creates a socket - TCP hasn't completed yet.
-                    // MarkAddressGood resets nAttempts=0, preventing stale address eviction.
-                    // Good is called after VERACK handshake completes (ProcessVerackMessage).
-                }
-            }
-
-            if (connections_made > 0) {
-                LogPrintf(NET, INFO, "[CConnman] Made %zu new outbound connection(s) from AddrMan\n",
-                          connections_made);
             }
         }
+
+        auto fill_class = [&](CNode::OutboundClass cls,
+                              size_t current,
+                              size_t target,
+                              const char* class_name) {
+            if (current >= target) return;
+            const size_t needed = target - current;
+            auto addrs = m_peer_manager->SelectAddressesToConnect(
+                static_cast<int>(needed * 3));
+            size_t made = 0;
+            for (const auto& addr : addrs) {
+                if (made >= needed) break;
+                std::string ip_str = addr.ToStringIP();
+                if (connected_ips.count(ip_str)) continue;
+                if (!addr.IsRoutable()) continue;
+                m_peer_manager->MarkAddressTried(addr);
+                CNode* pnode = ConnectNode(addr, /*manual=*/false, cls);
+                if (pnode) {
+                    LogPrintf(NET, INFO,
+                        "[CConnman] ThreadOpenConnections: connected to %s as %s (node %d)\n",
+                        ip_str.c_str(), class_name, pnode->id);
+                    ++made;
+                    connected_ips.insert(std::move(ip_str));
+                }
+            }
+            if (made > 0) {
+                LogPrintf(NET, INFO,
+                    "[CConnman] Made %zu new %s outbound connection(s) from AddrMan\n",
+                    made, class_name);
+            }
+        };
+
+        fill_class(CNode::OutboundClass::FullRelay,  full_relay_count,
+                   TARGET_FULL_RELAY,  "FullRelay");
+        fill_class(CNode::OutboundClass::BlockRelay, block_relay_count,
+                   TARGET_BLOCK_RELAY, "BlockRelay");
 
         } // end !m_connect_only (skip seeds + AddrMan when --connect used)
 
@@ -1229,7 +1277,7 @@ void CConnman::SocketHandler() {
                 // BUG #148 ROOT CAUSE FIX: Check return value!
                 // If RegisterNode returns false (banned IP), do NOT add to m_nodes
                 // Otherwise GetNode() will return nullptr during handshake
-                if (!m_peer_manager->RegisterNode(node_id, pnode, addr, true)) {
+                if (!DispatchPeerConnected(node_id, pnode, addr, true)) {
                     LogPrintf(NET, WARN, "[CConnman] Rejecting banned inbound from %s\n", ip_str);
                     // Node destructor will close socket
                     continue;  // Skip to next pending connection
@@ -1645,12 +1693,10 @@ void CConnman::DisconnectNodes() {
                 // to exist in the peers map to clean up mapBlocksInFlight entries.
                 // If RemoveNode is called first, GetAndClearPeerBlocks bails early
                 // and mapBlocksInFlight entries are never cleaned up = memory leak.
-                if (m_peer_manager) {
-                    m_peer_manager->OnPeerDisconnected(node_id);
-                }
+                DispatchPeerDisconnected(node_id);
 
                 // BUG #153 FIX: Remove from CPeerManager BEFORE destroying CNode
-                // This ensures node_refs is cleared while CNode still exists
+                // This ensures node_refs is cleared while CNode still exists.
                 if (m_peer_manager) {
                     m_peer_manager->RemoveNode(node_id);
                 }

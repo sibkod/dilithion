@@ -99,6 +99,23 @@ ChainParams ChainParams::Mainnet() {
     // Moved from 20160 to 18500 to stop ongoing chain degradation.
     params.compactEncodingFixHeight = 18500;
 
+    // Phase 3 port: HeadersSync PRESYNC chain-work gate. Zero for now
+    // (preserves pre-port behaviour where this gate was hardcoded zero in
+    // CHeadersManager). A non-zero value can be set in a follow-up after
+    // smoke-testing that a fresh node successfully clears the threshold
+    // against a live seed. Q7 plan recommendation deferred to Phase 4.
+    params.nMinimumChainWork = uint256();
+
+    // Phase 4 port: outbound connection class targets. DIL has 240s blocks
+    // where propagation latency is well-absorbed; Bitcoin defaults are fine.
+    params.nOutboundFullRelayTarget = 8;
+    params.nOutboundBlockRelayTarget = 2;
+
+    // Phase 6 PR6.1 (v1.5 §3.2 + Cursor CONCERN 1): mapBlockIndex cap.
+    // 500K covers ~14 weeks at one attacker-header-per-second sustained
+    // rate — well past the IBD horizon for 240s-block DIL.
+    params.nMapBlockIndexCap = 500000;
+
     // ASERT difficulty algorithm activation
     // Replaces periodic retarget + EDA with per-block exponential adjustment.
     // Anchor block: height 23039 (the block at activationHeight - 1).
@@ -125,6 +142,8 @@ ChainParams ChainParams::Mainnet() {
     params.consecutiveMinerStallExemptionRetiredHeight = 999999999;  // v4.0.21 Patch A: disabled on DIL (no VDF)
     params.soloExemptionLifetimeGateHeight = 999999999;              // v4.0.21 Patch C: disabled on DIL (no VDF)
     params.timeBasedCooldownExpiryRetiredHeight = 999999999;         // v4.0.22 Patch E: disabled on DIL (no VDF)
+    params.timeDecayCooldownActivationHeight = 999999999;            // v4.2.0: disabled on DIL (no VDF / no per-MIK cooldown)
+    params.cooldownTimeDecaySeconds = 60;                            // v4.2.0: ignored on DIL but kept for type-safety
     params.vdfCooldownShortWindow = 0;               // Disabled (VDF not active on mainnet)
     params.stabilizationForkHeight = 999999999;      // Disabled (VDF not active on mainnet)
     params.mikWindowCapWindow = 0;                   // Disabled (VDF not active on mainnet)
@@ -300,6 +319,16 @@ ChainParams ChainParams::Testnet() {
     // Timestamp validation: active from genesis on testnet
     params.timestampValidationHeight = 0;
 
+    // Phase 3 port: testnet has no PRESYNC chain-work gate.
+    params.nMinimumChainWork = uint256();
+
+    // Phase 4 port: outbound class targets — testnet uses DIL defaults.
+    params.nOutboundFullRelayTarget = 8;
+    params.nOutboundBlockRelayTarget = 2;
+
+    // Phase 6 PR6.1: mapBlockIndex cap — testnet matches mainnet semantics.
+    params.nMapBlockIndexCap = 500000;
+
     // VDF Fair Mining — VDF-only from genesis for MVP testing
     params.vdfActivationHeight = 0;
     params.vdfExclusiveHeight  = 0;            // VDF-only from genesis (like DilV)
@@ -316,6 +345,8 @@ ChainParams ChainParams::Testnet() {
     params.consecutiveMinerStallExemptionRetiredHeight = 0;  // v4.0.21 Patch A: testnet retires stall exemption from genesis
     params.soloExemptionLifetimeGateHeight = 0;              // v4.0.21 Patch C: testnet activates lifetime gate from genesis
     params.timeBasedCooldownExpiryRetiredHeight = 0;         // v4.0.22 Patch E: testnet retires time-based expiry from genesis
+    params.timeDecayCooldownActivationHeight = 0;            // v4.2.0: testnet activates time-decay cooldown from genesis
+    params.cooldownTimeDecaySeconds = 60;                    // v4.2.0: 60s decay rate (1 cooldown-block per minute)
     params.vdfCooldownShortWindow = 0;         // Disabled — avoids MIN_COOLDOWN bypass
     params.stabilizationForkHeight = 0;        // Dual-window + time expiry from genesis
     params.mikWindowCapWindow = 480;           // 480 blocks = ~6h at 45s/block (MVP)
@@ -420,7 +451,7 @@ ChainParams ChainParams::DilV() {
     // Genesis block itself is exempt (code at chain.cpp:889-890 skips height 0)
     // MIK required from block 1 onward
     params.dfmpActivationHeight = 0;
-    params.dfmpAssumeValidHeight = 44469;  // v4.0.22: 2026-04-25 incident -- skip strict consensus checks (cooldown, MIK, DNA, attestation) for historical chain through the convergence checkpoint at 44469. Above 44469, Patches A/C activate (44470) and strict deterministic rules apply. Bypass exactly matches checkpoint height -- no vulnerability window.
+    params.dfmpAssumeValidHeight = 44233;  // v4.1 (was 44469): aligned with the new mandatory rollback checkpoint at 44233. Skips strict consensus checks (cooldown, MIK, DNA, attestation) only for blocks AT OR BELOW the canonical 44233 anchor. Above 44233, Patches A/C/E activate AND consensus checks are enforced — no bypass window. (v4.0.22 had this at 44469 with Patches at 44470, leaving 44234-44469 unprotected; that re-creates the v4.0.22 stop-gap failure mode. See cross-component audit finding HIGH-1.)
 
     // All DFMP versions active from genesis — use modern rules from day one
     params.dfmpV3ActivationHeight = 0;
@@ -441,6 +472,20 @@ ChainParams ChainParams::DilV() {
     // Timestamp validation: active from genesis
     params.timestampValidationHeight = 0;
 
+    // Phase 3 port: DilV starts with no PRESYNC chain-work gate; the
+    // gate value can be tightened in Phase 4 after telemetry confirms
+    // typical fresh-node IBD work accumulation against live seeds.
+    params.nMinimumChainWork = uint256();
+
+    // Phase 4 port: outbound class targets — DilV's 45s blocks benefit
+    // from faster propagation, so bump BlockRelay to 4 (Q4 recommendation).
+    params.nOutboundFullRelayTarget = 8;
+    params.nOutboundBlockRelayTarget = 4;
+
+    // Phase 6 PR6.1: mapBlockIndex cap — DilV is 5M (10× DIL) because
+    // its 60s blocks produce headers ~4× faster than DIL's 240s.
+    params.nMapBlockIndexCap = 5000000;
+
     // VDF: active from genesis — DilV is a VDF-only chain
     params.vdfActivationHeight = 0;
     params.vdfExclusiveHeight  = 0;            // No RandomX blocks ever accepted
@@ -454,23 +499,34 @@ ChainParams ChainParams::DilV() {
     params.dfmpCooldownConsensusHeight = 0;    // Consensus-enforced cooldown from genesis
     params.stallExemptionV2Height = 0;         // Tightened stall exemption from genesis
     params.consecutiveMinerCheckHeight = 0;    // Reject >3 consecutive blocks from same miner from genesis
-    // v4.0.22 -- Patches A/C/E pushed to height 50000 (was 44470) on
-    // 2026-04-25 after the 44470 activation produced an unrecoverable
-    // consensus split: v4.0.16 miners continued producing blocks under
-    // the OLD cooldown rules (no stall-exemption retirement, no solo
-    // gate, time-based expiry still active), and v4.0.22 seeds with the
-    // new rules at 44470 rejected those blocks. The miner network kept
-    // extending the v4.0.16 chain past 44760+, while the seed canonical
-    // chain (NYC/SYD) stalled at ~44494. Pushing all three activations
-    // to 50000 lets seeds accept the v4.0.16 chain through the existing
-    // miner population, gives time to coordinate a miner upgrade before
-    // the new rules engage, and avoids forcing the choice between
-    // "minority canonical chain" and "longer rule-violating chain"
-    // tonight. The cooldown rule changes are still planned -- just
-    // moved to a coordinated upgrade window above the live tip.
-    params.consecutiveMinerStallExemptionRetiredHeight = 50000;
-    params.soloExemptionLifetimeGateHeight = 50000;
-    params.timeBasedCooldownExpiryRetiredHeight = 50000;
+    // v4.1 (2026-05-02) — Mandatory upgrade. Chain rollback to height 44233
+    // (last common ancestor across NYC/LDN/SGP/SYD per 2026-05-02 multi-seed
+    // hash agreement). Replaces the v4.0.22 50000 stop-gap that never resolved
+    // because the chain split made coordinated miner upgrade impossible.
+    //
+    // Activation height = checkpoint height = rollback target = 44233.
+    // Strict activation: miner pre-upgrade is REQUIRED before seed cutover
+    // (operator coordinates via Telegram quorum gate per v4_1 spec §5.3).
+    //
+    // CRITICAL: this is paired with the checkpoint at 44233 below — without
+    // the checkpoint, v4.1 nodes could silently extend any of the four
+    // incident-era forks. With both, v4.1 nodes only follow the chain whose
+    // block-44233 hash matches the canonical anchor.
+    params.consecutiveMinerStallExemptionRetiredHeight = 44233;
+    params.soloExemptionLifetimeGateHeight = 44233;
+    params.timeBasedCooldownExpiryRetiredHeight = 44233;
+    // v4.2.0 — Time-decay cooldown activation, height 44255 on DilV mainnet.
+    // The brittle stall-exemption-tier system in chain.cpp is REPLACED by the
+    // self-correcting time-decay rule at and above this height. See spec
+    // .claude/contracts/v4_2_time_decay_cooldown_spec.md.
+    //
+    // Chosen as tip+6 from the 2026-05-03 stall-recovery cutover (London tip
+    // was 44249 at decision time; NYC/SYD/SGP recovering). Forward-activation
+    // (no in-flight blocks need re-validation) → zero consensus-fork risk.
+    // The +6 buffer accommodates any block produced during seed restoration
+    // before all v4.2 binaries are deployed.
+    params.timeDecayCooldownActivationHeight = 44250;  // v4.3 KEEPS this active 2026-05-04. Earlier draft of v4.3 set 999999999 to disable; reconsidered after operator review noted: time-decay is currently the chain's only unstick mechanism (livenessTimeout via legacy path was demonstrated to deadlock on 2026-05-03 — chain stalled 5h at h=44249 before v4.2.0 activated time-decay at 44250). Returning to legacy path = stall risk, NOT return to pre-Apr-25 clean state (those rules have been retired/replaced since then). v4.3's actual fix is the port path correctness (A1 + ABI + connman) — once stuck v4.1 peers sync past 44249 via ABI flag-merge fix, active-miner cache refreshes higher, time-decay self-corrects to lower cooldown values. Cooldown layer retirement deferred to chain reset OR v4.4 properly-engineered transition.
+    params.cooldownTimeDecaySeconds = 60;      // 1 cooldown-block drains per 60s wall-clock
     params.vdfCooldownShortWindow = 0;         // Disabled at genesis — avoids short-window MIN_COOLDOWN bypass
     params.stabilizationForkHeight = 0;        // Dual-window cooldown + time-based expiry from genesis
 
@@ -545,21 +601,43 @@ ChainParams ChainParams::DilV() {
     params.checkpoints.emplace_back(15000, uint256S("45f5877adcc1ec2dab453412d6a5cb3fd9383fc97a184aa4ec855db55212f5d6"));
     params.checkpoints.emplace_back(18700, uint256S("1fbcf55c40c735596b68772af0072b98342a098bd5c1ff0b3bb26423720e9295"));
     params.checkpoints.emplace_back(36500, uint256S("3a6c72ee0ac27508fe82b76ed561dc93bc52ee5a26825cbf3f693bbc7070fd63"));
-    // v4.0.22 (2026-04-25): the 44469 convergence checkpoint was REMOVED.
-    // Originally added to anchor the seed-chosen canonical chain after the
-    // 2026-04-25 incident, but in combination with the Patches A/C/E
-    // cooldown rule changes activating at 44470 it created an unrecoverable
-    // consensus split: v4.0.16 miners kept extending their pre-checkpoint
-    // chain (rejected by the 44469 checkpoint at chainstate level) while
-    // the seed canonical chain was rejected from accumulating blocks (any
-    // miner-produced block past 44470 hit cooldown violation). With both
-    // the cooldown rules pushed to 50000 AND this checkpoint removed,
-    // chain-work-based selection (with Patch H storing competing siblings)
-    // can pick whichever chain the network actually extends -- restoring
-    // automatic convergence with the live miner population. The next solid
-    // checkpoint at 44000 remains as the last pre-incident anchor; any
-    // future post-incident anchor must be added only after rule changes
-    // are coordinated with miners.
+    // v4.1 (2026-05-02): MANDATORY ROLLBACK ANCHOR.
+    //
+    // Verified hash: 927a1e79a410e73c1778dd3eaebae1c07ce5271431abffa9b62a6f6b3177e373
+    //
+    // Confirmed independently 2026-05-02 from all four DilV mainnet seeds
+    // (NYC tip 44740, LDN tip 44491, SGP tip 44542, SYD tip 44700) — each
+    // currently on a DIFFERENT post-incident chain. The agreement at 44233
+    // across four nodes that disagree at every height above 44233 is the
+    // canonical pre-fork ancestor.
+    //
+    // History: the v4.0.22 50000-stop-gap (Patches A/C/E pushed to height
+    // 50000) failed to resolve because the chain was already split four
+    // ways and no rule-based mechanism could converge them. v4.1 reverts
+    // to the original v4.0.21 plan: hard rollback at the last common
+    // ancestor with three-tier ABC enforcement (chain.cpp), header-time
+    // enforcement (headers_manager.cpp), and a startup validator
+    // (startup_checkpoint_validator.cpp) ensuring every v4.1 node refuses
+    // any chain whose block-44233 hash differs from the embedded value.
+    //
+    // The Patches A/C/E activation heights (above) are now also 44233,
+    // matching this checkpoint. Together they constitute the v4.1
+    // mandatory upgrade.
+    params.checkpoints.emplace_back(44233, uint256S("927a1e79a410e73c1778dd3eaebae1c07ce5271431abffa9b62a6f6b3177e373"));
+
+    // v4.1 lifetime-miner deterministic snapshot (closes CRIT-1 from
+    // v0.1 spec review — non-deterministic Patch C lifetime gate at
+    // activation height if pre-44233 history is ingested differently
+    // across nodes). Placeholder = 0 disables the assertion (gated on
+    // > 0 in startup_checkpoint_validator.cpp::ValidateLifetimeMinerSnapshot).
+    // Pass-1 build runs on a clean datadir, IBDs to >= 44232, queries
+    // getfullmikdistribution {"maxHeight": 44232}, and the unique_miners
+    // count is embedded here for the pass-2 release build.
+    //
+    // PRE-RELEASE GATE: grep this file for lifetimeMinerCountAt44232; the
+    // value MUST be > 0 before tagging v4.1 (the release SOP includes
+    // this check).
+    params.lifetimeMinerCountAt44232 = 255;  // v4.1.2 re-capture 2026-05-03: original 65 was from the BUGGY sliding-window query (window=200, captured at tip=44233) and never matched the fixed lifetime-store semantic. Re-captured 2026-05-03 against the canonical chain (Phase 1 checkpoint at 44233 = 927a1e79... passed). Three independent computations on chains whose Phase 1 passed (SYD live, user's local Windows, LDN-source snapshot) converged on 255.
 
     // No assume-valid yet
     params.defaultAssumeValid = "";
@@ -571,6 +649,112 @@ ChainParams ChainParams::DilV() {
     // Exploiter addresses (9,389) excluded via transaction graph analysis
     // =========================================================================
     #include "dilv_prefund.inc"
+
+    return params;
+}
+
+// ===========================================================================
+// Phase 5 (2026-04-26): Regression-test mode.
+// ===========================================================================
+//
+// Regtest is a deterministic, isolated network for byte-equivalence
+// integration tests. Built on the testnet baseline with these overrides:
+//   * Distinct network magic + ports (no cross-contamination)
+//   * No checkpoints (reorgs can be tested freely)
+//   * Reduced VDF iterations for fast block generation
+//   * Short grace period + faster block time for tests
+//   * No pre-funded addresses
+//
+// Used by: tools/run_phase5_v2_byte_equivalence.sh and similar test
+// scripts that spin up two binaries with different env-var settings,
+// mine N blocks, and compare LevelDB hashes.
+ChainParams ChainParams::Regtest() {
+    // Start from testnet (most permissive baseline) and override.
+    ChainParams params = Testnet();
+    params.network = REGTEST;
+
+    // Network identification — distinct from mainnet/testnet/dilv.
+    params.networkMagic = 0xDA8FB5BB;  // Regtest magic
+    params.chainID = 9999;             // Regtest chain ID
+
+    // Distinct ports for regtest (allow running alongside any other network).
+    params.p2pPort = 19444;
+    params.rpcPort = 19332;
+
+    // Regtest datadir.
+    params.dataDir = GetDataDir(false) + "-regtest";
+
+    // No checkpoints — regtest exists to test reorgs, including deep ones.
+    params.checkpoints.clear();
+    params.defaultAssumeValid = "";
+
+    // Identifying coinbase message for regtest blocks.
+    params.genesisCoinbaseMsg = "Dilithion Regtest";
+    params.genesisHash = "";  // computed at startup
+
+    // Phase 5 (2026-04-26): regtest IS a VDF chain, run via dilv-node binary.
+    //
+    // Why dilv-node: dilithion-node calls Genesis::CreateGenesisBlock() at
+    // boot (non-VDF path), which fails IsGenesisBlock's nVersion check
+    // when genesis params indicate VDF-from-genesis. dilv-node correctly
+    // calls CreateDilVGenesisBlock(), so a fresh regtest datadir loads
+    // cleanly there.
+    //
+    // The chain-selection algorithm is chain-agnostic (same CChainState,
+    // same m_setBlockIndexCandidates, same ActivateBestChainStep
+    // regardless of IHeaderProofChecker). V2 byte-equivalence on the
+    // DilV-style regtest chain proves the algorithm equally for DIL.
+    //
+    // Reduced VDF iterations for fast block production in tests
+    // (~0.4-0.8s per block at 50K iterations vs production's 500K).
+    params.vdfIterations = 50000;
+    params.vdfLotteryGracePeriod = 3;  // 3s grace
+    params.blockTime = 3;              // 3s target
+
+    // Phase 6 PR6.1: mapBlockIndex cap — regtest uses a SMALL cap (1000)
+    // so cap-saturation tests can exercise eviction without flooding 500K+
+    // headers. Override of inherited Testnet value.
+    params.nMapBlockIndexCap = 1000;
+
+    // Phase 8 PR8.0 (2026-05-01): disable the 45s minBlockTimestampGap
+    // inherited from Testnet. Regtest inherits Testnet's gap = 45 + height = 0
+    // ("active from genesis"), which throttles single-miner regtest setups
+    // to ~45s/block — too slow to hit Phase 8 acceptance bars (≥20 blocks
+    // within 60s for the 4-node harness). The gap is a Sybil/pacing rule
+    // for production VDF chains; regtest is a deterministic single-process
+    // (or few-process) lab environment with no Sybil surface to defend.
+    // Disabling it lets blocks publish immediately after VDF + DFMP
+    // validation succeed. Consensus-side check at pow.cpp:1422 is gated
+    // on `minGap > 0`, so setting to 0 disables both the miner-side wait
+    // (vdf_miner.cpp:396-407) AND the consensus-side enforcement.
+    params.minBlockTimestampGap = 0;
+    params.minBlockTimestampGapHeight = 0;
+
+    // Phase 10 PR10.6-followup-2 (2026-05-02): disable Patch E (time-based
+    // cooldown expiry retirement) on regtest. Patch E is a DilV-mainnet
+    // incident-recovery rule that retires the "MIN_COOLDOWN=2 solo miner
+    // waits ~95s via time-based expiry" path. Regtest inherits Testnet's
+    // value of 0 (active from genesis), which deadlocks the single-miner
+    // smoke harness at height 1: with cooldown=2 and time-based expiry
+    // retired, the only escape is block-gap >= 2, but block 2 can never
+    // be produced because block 2 IS what's blocked. Set to 999999999
+    // (DIL-style sentinel) to keep the legacy time-based expiry path
+    // active on regtest, matching the cooldown_tracker.h design comment.
+    params.timeBasedCooldownExpiryRetiredHeight = 999999999;
+
+    // v4.2.0 PR follow-up: disable time-decay cooldown on regtest as well, for
+    // the same reason as Patch E — single-miner regtest harnesses need the
+    // legacy time-based expiry to escape MIN_COOLDOWN=2. Above-activation
+    // tests construct their own CCooldownTracker with explicit params and do
+    // NOT rely on chainparams; so disabling the chainparams field here only
+    // affects the regtest-via-chainparams path.
+    params.timeDecayCooldownActivationHeight = 999999999;
+    // ISSUE-2 (close-readiness): set every chain's cooldownTimeDecaySeconds
+    // explicitly. Regtest copies from testnet which sets 60; if testnet were
+    // to change to a different rate (e.g. 30 for fast cycles), regtest would
+    // silently inherit it while having activation disabled — confusing.
+    // Make the asymmetry explicit instead.
+    params.cooldownTimeDecaySeconds = 60;
 
     return params;
 }

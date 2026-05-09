@@ -115,56 +115,59 @@ void CIbdCoordinator::Tick() {
     }
 
     // =========================================================================
-    // BUG #277 + v4.0.19: Auto-recovery from chain corruption
+    // v4.3.2 M1: Auto-recovery from chain corruption — moved to free helper
     // =========================================================================
-    // Two failure modes feed into one recovery path:
-    //   - NeedsUTXORebuild()  : ConnectTip's ApplyBlock fails repeatedly (BUG #277)
-    //   - NeedsChainRebuild() : DisconnectTip's UndoBlock fails repeatedly on the
-    //                           same hash (v4.0.19, incident 2026-04-25)
-    // In either case we write the auto_rebuild marker file with a reason describing
-    // which signal fired, then trigger graceful shutdown.
-    {
-        const bool utxo_rebuild = m_chainstate.NeedsUTXORebuild();
-        const bool chain_rebuild = m_chainstate.NeedsChainRebuild();
-        if (utxo_rebuild || chain_rebuild) {
-            static bool recovery_triggered = false;
-            if (!recovery_triggered) {
-                recovery_triggered = true;
-                std::cerr << "\n==========================================================" << std::endl;
-                if (utxo_rebuild) {
-                    std::cerr << "CRITICAL: UTXO corruption detected! Auto-recovery initiated." << std::endl;
-                } else {
-                    std::cerr << "CRITICAL: Persistent UndoBlock failure detected! Auto-recovery initiated." << std::endl;
-                }
-                std::cerr << "The node will shut down and rebuild on next restart." << std::endl;
-                std::cerr << "==========================================================" << std::endl;
-
-                std::string datadir;
-                if (Dilithion::g_chainParams) {
-                    datadir = Dilithion::g_chainParams->dataDir;
-                }
-                // Build combined reason when BOTH signals fire so operators see the
-                // full picture in auto_rebuild (Cursor review feedback, 2026-04-25).
-                std::string reason;
-                const std::string heightStr = std::to_string(m_chainstate.GetHeight());
-                if (utxo_rebuild && chain_rebuild) {
-                    uint256 failing = m_chainstate.GetLastUndoFailureHash();
-                    reason = "UTXO corruption AND persistent UndoBlock failure at height "
-                             + heightStr + " hash=" + failing.GetHex();
-                } else if (utxo_rebuild) {
-                    reason = "UTXO corruption detected at height " + heightStr;
-                } else {
-                    uint256 failing = m_chainstate.GetLastUndoFailureHash();
-                    reason = "Persistent UndoBlock failure at height "
-                             + heightStr + " hash=" + failing.GetHex();
-                }
-                Dilithion::WriteAutoRebuildMarker(datadir, reason);
-
-                g_node_state.running = false;
-            }
-            return;
-        }
-    }
+    // The poll-and-write block previously lived here (lines 126-167 in v4.3.1).
+    // The v4.3.1 LDN canary 2026-05-04 failed because under the then-existing
+    // --usenewpeerman=1 path, this Tick() was bypassed (port::CPeerManager
+    // replaced CIbdCoordinatorAdapter as sync_coordinator), so the in-Tick()
+    // recovery path never reached its WriteAutoRebuildMarker call — [CRITICAL]
+    // logs printed but no marker was written and the chain regressed 254 blocks.
+    //
+    // Logic moved to Dilithion::MaybeTriggerChainRebuild and called from BOTH
+    // dilv-node.cpp and dilithion-node.cpp main loops, AFTER
+    // sync_coordinator->Tick(). Post v4.3.4 Option C cut, sync_coordinator
+    // always wraps CIbdCoordinator via CIbdCoordinatorAdapter (Block 7
+    // retired the alternate port::CPeerManager backing; Block 8 retired
+    // the --usenewpeerman flag) — but the main-loop helper survives because
+    // it remains the cleanest single dispatch point for the marker write.
+    //
+    // The early-return-on-recovery semantics from the legacy block are also
+    // preserved at the call site: when the helper fires, running=false is set
+    // and the next main-loop iteration exits before any further work runs. We
+    // do NOT need to early-return from THIS Tick() any more — the legacy
+    // sequence (write marker → set running=false → return) was an in-Tick()
+    // optimization to avoid touching headers/blocks after deciding to die; the
+    // helper preserves the kill-flag semantics and the main loop's
+    // running.load() check handles the rest.
+    //
+    // BEHAVIOURAL DELTA vs v4.3.1 (Cursor pre-impl review S3, 2026-05-04;
+    // tightened per Cursor v4.3.3 review S3, 2026-05-04):
+    // when Needs* is already true at Tick() entry, legacy behaviour skipped
+    // the rest of THIS Tick(). The new ordering runs ONE additional full
+    // Tick() body before MaybeTriggerChainRebuild shuts the process down on
+    // the next main-loop iteration. That body is NOT "peer-side only" — it
+    // reaches the full IBD orchestration:
+    //   * SwitchHeadersSyncPeer / SyncHeadersFromPeer — outbound GETHEADERS
+    //   * DownloadBlocks — block-fetch orchestration; queues GETDATA P2P
+    //     messages for blocks pending validation, may invoke fork-detection
+    //     side effects via block_fetcher
+    //   * AttemptForkRecovery — mutates fork-detection state, may queue
+    //     additional inv/getdata requests
+    // None of this performs ConnectTip / chainstate writes — those are
+    // gated separately. So the extra Tick() pass is bounded: on-disk
+    // chainstate is unchanged; outbound P2P messaging may briefly continue
+    // (queued, flushed by the net thread) before the main loop's
+    // running.load() check exits.
+    //
+    // There is NO production guard elsewhere that skips ConnectTip /
+    // validation purely because NeedsChainRebuild() is true (those reads
+    // only appear in this recovery path + tests). Strict byte-for-byte
+    // parity with legacy "no further coordinator work" would require an
+    // early-return here that duplicates the flag poll — explicit
+    // maintainability tradeoff that we accepted in favour of the
+    // single-chokepoint helper design.
+    // =========================================================================
 
     int header_height = m_node_context.headers_manager->GetBestHeight();
     int chain_height = m_chainstate.GetHeight();
@@ -1722,7 +1725,7 @@ bool CIbdCoordinator::FetchBlocks() {
 
                     uint256 headerChainWork;
                     if (m_node_context.headers_manager)
-                        headerChainWork = m_node_context.headers_manager->GetChainTipsTracker().GetBestChainWork();
+                        headerChainWork = m_node_context.headers_manager->GetBestHeaderChainWork();
 
                     if (!localChainWork.IsNull() && !headerChainWork.IsNull()) {
                         if (!ChainWorkGreaterThan(headerChainWork, localChainWork)) {
@@ -2433,12 +2436,19 @@ bool CIbdCoordinator::AttemptForkRecovery(int chain_height, int header_height, F
 
         uint256 headerChainWork;
         if (m_node_context.headers_manager)
-            headerChainWork = m_node_context.headers_manager->GetChainTipsTracker().GetBestChainWork();
+            headerChainWork = m_node_context.headers_manager->GetBestHeaderChainWork();
 
         if (!localChainWork.IsNull() && !headerChainWork.IsNull()) {
             if (!ChainWorkGreaterThan(headerChainWork, localChainWork)) {
-                if (g_verbose.load(std::memory_order_relaxed))
-                    std::cout << "[FORK-RECOVERY] Header chain has LESS work - NOT disconnecting" << std::endl;
+                // v4.1 audit fix HIGH-3: was verbose-gated. Promoted to always-on
+                // WARN. This is the exact failure mode from the 2026-04-25 SGP
+                // fork-recovery incident — operator needs to see this without
+                // --verbose otherwise IBD silently stalls on a stale fork.
+                LogPrintf(IBD, WARN,
+                    "[FORK-RECOVERY] Header chain has LESS work than local - NOT disconnecting "
+                    "(local_work=%s header_work=%s)\n",
+                    localChainWork.GetHex().substr(0, 16).c_str(),
+                    headerChainWork.GetHex().substr(0, 16).c_str());
                 m_fork_stall_cycles.store(0);
                 return false;
             }
@@ -2520,7 +2530,7 @@ bool CIbdCoordinator::AttemptForkRecovery(int chain_height, int header_height, F
 
     uint256 headerChainWork;
     if (m_node_context.headers_manager) {
-        headerChainWork = m_node_context.headers_manager->GetChainTipsTracker().GetBestChainWork();
+        headerChainWork = m_node_context.headers_manager->GetBestHeaderChainWork();
     }
 
     // If chainwork data is available for both sides, use it for the comparison.
@@ -2531,11 +2541,16 @@ bool CIbdCoordinator::AttemptForkRecovery(int chain_height, int header_height, F
         if (!ChainWorkGreaterThan(headerChainWork, localChainWork)) {
             std::string localHex = localChainWork.GetHex();
             std::string headerHex = headerChainWork.GetHex();
-            if (g_verbose.load(std::memory_order_relaxed)) {
-                std::cout << "[FORK-DETECT] Incoming fork has LESS work than our chain - NOT switching" << std::endl;
-                std::cout << "[FORK-DETECT] Local work=..." << localHex.substr(localHex.length() > 16 ? localHex.length() - 16 : 0)
-                          << " Header work=..." << headerHex.substr(headerHex.length() > 16 ? headerHex.length() - 16 : 0) << std::endl;
-            }
+            // v4.1 audit fix HIGH-4: was verbose-gated. Promoted to always-on
+            // WARN. Same operational class as HIGH-3 — fork-recovery refusal.
+            // Operators previously had no log entry indicating "I declined to
+            // switch chains because incoming has less work" → IBD silently
+            // stuck. Always log so the cause is visible.
+            LogPrintf(IBD, WARN,
+                "[FORK-DETECT] Incoming fork has LESS work than our chain - NOT switching "
+                "(local=...%s header=...%s)\n",
+                localHex.substr(localHex.length() > 16 ? localHex.length() - 16 : 0).c_str(),
+                headerHex.substr(headerHex.length() > 16 ? headerHex.length() - 16 : 0).c_str());
             m_fork_stall_cycles.store(0);
             return false;
         }
@@ -2639,8 +2654,9 @@ bool CIbdCoordinator::AttemptForkRecovery(int chain_height, int header_height, F
     std::map<int32_t, uint256> expectedHashes;
 
     if (m_node_context.headers_manager) {
-        const auto& tipsTracker = m_node_context.headers_manager->GetChainTipsTracker();
-        auto competingTips = tipsTracker.GetCompetingTips();
+        // PR5.2.B: GetChainTipsTracker retired; use GetCompetingHeaderTips
+        // which derives from setChainTips via headers_manager.
+        auto competingTips = m_node_context.headers_manager->GetCompetingHeaderTips();
 
         for (const auto& tip : competingTips) {
             if (tip.height == headerTipHeight) {
