@@ -27,16 +27,19 @@ case "$NETWORK" in
         DATA_DIR="${HOME}/.dilithion"
         RPC_PORT=8332
         NETWORK_LABEL="dil"
+        BINARY_NAME="dilithion-node"
         ;;
     testnet|test)
         DATA_DIR="${HOME}/.dilithion-testnet"
         RPC_PORT=18332
         NETWORK_LABEL="testnet"
+        BINARY_NAME="dilithion-node"
         ;;
     dilv)
         DATA_DIR="${HOME}/.dilv"
         RPC_PORT=9332
         NETWORK_LABEL="dilv"
+        BINARY_NAME="dilv-node"
         ;;
     *)
         echo "Usage: $0 [dil|mainnet|testnet|dilv]"
@@ -95,15 +98,20 @@ echo ""
 # CRITICAL: Node MUST be stopped for a clean snapshot
 # LevelDB corruption WILL occur if you archive while the node is running.
 # Use RPC stop or kill -15 (SIGTERM). NEVER use kill -9 or pkill.
-if pgrep -f dilithion-node > /dev/null 2>&1 || pgrep -f dilv-node > /dev/null 2>&1; then
-    echo "ERROR: Node is still running! LevelDB data will be corrupt."
+# Chain-aware check: only abort if the chain we're bootstrapping is still running.
+# Other chains run independently with separate data dirs — their state doesn't
+# affect this bootstrap. Use pgrep -x (exact binary name match) instead of -f
+# (full command line match) so we don't false-match on script content that
+# contains the binary name as a string.
+if pgrep -x "$BINARY_NAME" > /dev/null 2>&1; then
+    echo "ERROR: ${BINARY_NAME} is still running! LevelDB data will be corrupt."
     echo ""
     echo "Stop gracefully with RPC:"
     echo "  curl -s --user rpc:rpc -H 'X-Dilithion-RPC: 1' -H 'content-type:application/json' \\"
     echo "    --data-binary '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"stop\",\"params\":{\"confirm\":true}}' \\"
     echo "    http://127.0.0.1:${RPC_PORT}/"
     echo ""
-    echo "Or: kill -15 \$(pgrep -f dilithion-node)  # then WAIT for exit"
+    echo "Or: kill -15 \$(pgrep -x ${BINARY_NAME})  # then WAIT for exit"
     echo ""
     echo "NEVER use kill -9 or pkill — LevelDB WAL won't flush."
     exit 1
