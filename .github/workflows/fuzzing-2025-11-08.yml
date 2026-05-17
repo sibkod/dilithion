@@ -107,7 +107,7 @@ jobs:
           echo "✅ All 20 fuzzer smoke tests passed"
 
       - name: Upload fuzzer artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fuzzers-ubuntu-24.04
           path: fuzz_*

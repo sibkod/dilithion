@@ -65,7 +65,7 @@ jobs:
         ./package-dilv-macos-release.sh
 
     - name: Upload artifact
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: dilv-${{ steps.get_version.outputs.version }}-mainnet-macos-x64
         path: releases/dilv-${{ steps.get_version.outputs.version }}-mainnet-macos-x64.tar.gz
