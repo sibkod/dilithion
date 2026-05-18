@@ -305,8 +305,17 @@ BOOST_AUTO_TEST_CASE(corrupt_footer_cold_start) {
     {
         std::fstream f(fp.string(), std::ios::binary | std::ios::in | std::ios::out);
         BOOST_REQUIRE(f.is_open());
+        // Corrupt the footer's last byte. Read the original byte first and
+        // write a guaranteed-different value (original XOR 0xFF). Writing a
+        // fixed constant (0xCC) was flaky: the footer is a SHA3-256 digest, so
+        // ~1/256 of the time the last byte already equalled the constant,
+        // making the write a no-op, leaving the file valid and flaking this
+        // test (observed failing spuriously on unrelated PRs #62 and #69).
+        uint8_t original = 0;
+        f.seekg(file_size - 1);
+        BOOST_REQUIRE(f.read(reinterpret_cast<char*>(&original), 1));
+        const uint8_t flipped = static_cast<uint8_t>(original ^ 0xFF);
         f.seekp(file_size - 1);
-        const uint8_t flipped = 0xCC;
         f.write(reinterpret_cast<const char*>(&flipped), 1);
     }
 
