@@ -672,3 +672,11 @@ src/digital_dna/fingerprint_run*.json
 docs/EXPLORER-TXINDEX-HANDOFF-FOR-ZACH.md
 docs/ROADMAP-MAINNET-PRODUCTION-PARITY.md
 docs/WALLET-INTEGRATION-QUESTIONS-FOR-ZACH.md
+
+# Repo audit 2026-05-18 — scratch / debug / test-node-data dirs committed by mistake
+/tmp/
+/Debug output/
+/test-isolation/
+/test-isolation2/
+/test-iso3/
+/test-dll-check/
