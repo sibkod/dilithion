@@ -8,7 +8,19 @@ on:
 
 jobs:
   build-macos:
-    runs-on: macos-latest
+    # Per-architecture matrix: build natively on each runner so the produced
+    # binary's architecture is honest. macOS releases used to run only on
+    # `macos-latest` (now Apple Silicon) and ship the arm64 binary under an
+    # `-x64` name — unrunnable on Intel Macs ("Bad CPU type in executable").
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-13   # Intel x86_64
+            arch: x64
+          - runner: macos-14   # Apple Silicon arm64
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
 
     steps:
     - name: Checkout code
@@ -51,6 +63,8 @@ jobs:
         make clean
         make -j$(sysctl -n hw.ncpu)
         ls -lh dilithion-node check-wallet-balance genesis_gen
+        echo "Built architecture:"
+        file dilithion-node
 
     - name: Extract version from tag
       id: get_version
@@ -66,6 +80,7 @@ jobs:
     - name: Create release package
       env:
         VERSION: ${{ steps.get_version.outputs.version }}
+        ARCH: ${{ matrix.arch }}
       run: |
         chmod +x package-macos-release.sh
         ./package-macos-release.sh
@@ -73,13 +88,13 @@ jobs:
     - name: Upload artifact
       uses: actions/upload-artifact@v7
       with:
-        name: dilithion-${{ steps.get_version.outputs.version }}-mainnet-macos-x64
-        path: releases/dilithion-${{ steps.get_version.outputs.version }}-mainnet-macos-x64.tar.gz
+        name: dilithion-${{ steps.get_version.outputs.version }}-mainnet-macos-${{ matrix.arch }}
+        path: releases/dilithion-${{ steps.get_version.outputs.version }}-mainnet-macos-${{ matrix.arch }}.tar.gz
 
     - name: Upload to release (if tag)
       if: startsWith(github.ref, 'refs/tags/')
       uses: softprops/action-gh-release@v1
       with:
-        files: releases/dilithion-${{ steps.get_version.outputs.version }}-mainnet-macos-x64.tar.gz
+        files: releases/dilithion-${{ steps.get_version.outputs.version }}-mainnet-macos-${{ matrix.arch }}.tar.gz
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -9,7 +9,10 @@
 if [ -z "$VERSION" ]; then
     VERSION="v1.4.0"
 fi
-RELEASE_NAME="dilithion-${VERSION}-mainnet-macos-x64"
+# ARCH selects the macOS CPU architecture: "x64" (Intel) or "arm64" (Apple
+# Silicon). Defaults to x64 for backward compatibility when run standalone.
+ARCH="${ARCH:-x64}"
+RELEASE_NAME="dilithion-${VERSION}-mainnet-macos-${ARCH}"
 RELEASE_DIR="releases/${RELEASE_NAME}"
 
 echo ""
