@@ -50,8 +50,9 @@
 // NET-003 FIX: Define consensus limits to prevent integer overflow in vector resize
 // These prevent DoS attacks via malicious size values causing heap corruption
 // Note: vtx is a byte vector (serialized tx data), so this limits BYTES not tx count.
-// Must equal consensus Consensus::MAX_BLOCK_SIZE (4 MB) to accept all valid blocks.
-static const uint64_t MAX_BLOCK_VTX_BYTES = 4 * 1024 * 1024;  // 4 MB (matches Consensus::MAX_BLOCK_SIZE / storage layer)
+// BUG-003 follow-up: references Consensus::MAX_BLOCK_SIZE directly so the P2P
+// receive cap can never drift from the consensus block-size limit.
+static const uint64_t MAX_BLOCK_VTX_BYTES = static_cast<uint64_t>(Consensus::MAX_BLOCK_SIZE);
 static const uint64_t MAX_TX_INPUTS = 10000;            // Max inputs per transaction
 static const uint64_t MAX_TX_OUTPUTS = 10000;           // Max outputs per transaction
 static const uint64_t MAX_SCRIPT_SIZE = 20000;          // Max script size (raised for Dilithium sigs)

@@ -2,6 +2,7 @@
 #include "../attestation/seed_pubkeys_testnet.h"
 #include "../attestation/seed_pubkeys_mainnet.h"
 #include <util/system.h>
+#include <consensus/params.h>  // BUG-003 follow-up: maxBlockSize references Consensus::MAX_BLOCK_SIZE
 
 namespace Dilithion {
 
@@ -44,7 +45,7 @@ ChainParams ChainParams::Mainnet() {
     params.difficultyForkHeight = 18500;   // Activate v2 difficulty at this height (moved from 20160 to fix sign bit + EDA interaction)
     params.difficultyMaxChange = 2;        // 2x max change per retarget (post-fork, pre-v3)
     params.difficultyV3ForkHeight = 20520; // v3: 4x clamp + 1-hour EDA threshold (15 blocks)
-    params.maxBlockSize = 4 * 1024 * 1024; // 4 MB (for post-quantum signatures) — BUG-003: must equal Consensus::MAX_BLOCK_SIZE (consensus/params.h)
+    params.maxBlockSize = static_cast<uint32_t>(Consensus::MAX_BLOCK_SIZE); // 4 MB (for post-quantum signatures); BUG-003 follow-up: single source of truth
 
     // Mining parameters
     params.initialReward = 50ULL * 100000000ULL; // 50 DIL (in ions: 1 DIL = 100,000,000 ions)
@@ -267,7 +268,7 @@ ChainParams ChainParams::Testnet() {
     params.difficultyForkHeight = 0;       // Active from genesis on testnet
     params.difficultyMaxChange = 2;        // 2x max change per retarget (pre-v3)
     params.difficultyV3ForkHeight = 0;     // v3 active from genesis on testnet
-    params.maxBlockSize = 4 * 1024 * 1024; // 4 MB (same as mainnet) — BUG-003: must equal Consensus::MAX_BLOCK_SIZE (consensus/params.h)
+    params.maxBlockSize = static_cast<uint32_t>(Consensus::MAX_BLOCK_SIZE); // 4 MB (same as mainnet); BUG-003 follow-up: single source of truth
 
     // Mining parameters (same as mainnet)
     params.initialReward = 50ULL * 100000000ULL; // 50 DIL (same as mainnet)
@@ -440,7 +441,7 @@ ChainParams ChainParams::DilV() {
     params.difficultyForkHeight = 999999999;   // Disabled
     params.difficultyMaxChange = 0;            // Unused
     params.difficultyV3ForkHeight = 999999999; // Disabled
-    params.maxBlockSize = 4 * 1024 * 1024;     // 4 MB (same as DIL — room for Dilithium signatures) — BUG-003: must equal Consensus::MAX_BLOCK_SIZE (consensus/params.h)
+    params.maxBlockSize = static_cast<uint32_t>(Consensus::MAX_BLOCK_SIZE);     // 4 MB (same as DIL — room for Dilithium signatures); BUG-003 follow-up: single source of truth
 
     // Mining parameters
     params.initialReward = 100ULL * 100000000ULL; // 100 DilV per block (in volts: 1 DilV = 100,000,000 volts)
