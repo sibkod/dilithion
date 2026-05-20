@@ -21,6 +21,11 @@ jobs:
         # RandomX not needed for dilv-node consensus (DilV uses VDF) but
         # init it so the shared Makefile's randomx link step doesn't error.
         git submodule update --init depends/randomx || true
+        # CI-fix 2026-05-20 (v4.4.2): libzmq is a submodule required by the
+        # Makefile's `libzmq` target which dilv-node depends on. Previously
+        # omitted here, causing CMake to fail with "source directory does
+        # not appear to contain CMakeLists.txt" → exit 2.
+        git submodule update --init depends/libzmq
 
     - name: Install dependencies
       run: |
