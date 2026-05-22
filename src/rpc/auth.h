@@ -190,6 +190,74 @@ bool Base64Decode(const std::string& encoded, std::vector<uint8_t>& decoded);
  */
 bool SecureCompare(const uint8_t* a, const uint8_t* b, size_t len);
 
+/**
+ * @brief Result of a cached auth lookup.
+ */
+enum class CachedAuthResult {
+    HitSuccess,   ///< cache hit, credentials previously verified OK
+    HitFail,      ///< cache hit, credentials previously verified BAD
+    Miss          ///< no cache entry — caller must run full PBKDF2 path
+};
+
+/**
+ * @brief Try to satisfy an auth request from the in-memory credential cache.
+ *
+ * Cache key is SHA3-256(username || 0x00 || password). The cache is bounded
+ * (256 entries, FIFO eviction), thread-safe, and TTL-bounded
+ * (success: 60s, failure: 5s). The cache prevents repeated PBKDF2-HMAC-SHA3
+ * (100k iters, ~50–100 ms CPU per call) for high-rate same-credential
+ * traffic — without the cache, sustained Explorer load on the same RPC
+ * credential saturates a 2-vCPU host and produces a CLOSE-WAIT socket leak
+ * because clients FIN before the server finishes PBKDF2 on a dead request.
+ *
+ * On HitSuccess: permissionsOut is populated with the cached permissions
+ * bitmask (as stored by CacheAuthSuccess).
+ *
+ * @param username Plaintext username from Basic auth.
+ * @param password Plaintext password from Basic auth.
+ * @param permissionsOut Output: permissions bitmask if HitSuccess.
+ * @return CachedAuthResult — HitSuccess, HitFail, or Miss.
+ *
+ * @note On Miss, callers must run the full RPCAuth::AuthenticateRequest +
+ *       CRPCPermissions::AuthenticateUser path and call CacheAuthSuccess /
+ *       CacheAuthFail to populate the cache.
+ * @note Lockout / rate-limit checks are NOT bypassed: callers must check
+ *       lockout BEFORE consulting the cache.
+ */
+CachedAuthResult TryCachedAuth(const std::string& username,
+                               const std::string& password,
+                               uint32_t& permissionsOut);
+
+/**
+ * @brief Insert a verified-good credential into the auth cache.
+ *
+ * TTL: 60 seconds. Inserts evict the oldest entry if the cache is full.
+ *
+ * @param username Plaintext username.
+ * @param password Plaintext password.
+ * @param permissions Permissions bitmask resolved via CRPCPermissions.
+ */
+void CacheAuthSuccess(const std::string& username,
+                      const std::string& password,
+                      uint32_t permissions);
+
+/**
+ * @brief Insert a verified-bad credential into the auth cache.
+ *
+ * TTL: 5 seconds (shorter window: limits negative-cache abuse vector
+ * for legitimate user typos).
+ *
+ * @param username Plaintext username.
+ * @param password Plaintext password.
+ */
+void CacheAuthFail(const std::string& username,
+                   const std::string& password);
+
+/**
+ * @brief Clear all cached credentials. Used by tests and on credential rotation.
+ */
+void ClearAuthCache();
+
 } // namespace RPCAuth
 
 #endif // DILITHION_RPC_AUTH_H

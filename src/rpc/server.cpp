@@ -1209,40 +1209,80 @@ void CRPCServer::HandleClient(int clientSocket) {
             return;
         }
 
-        // Authenticate
-        if (!RPCAuth::AuthenticateRequest(username, password)) {
-            // RPC-016 FIX: Audit log failed authentication attempt
-            std::cout << "[RPC-SECURITY] Failed authentication from " << clientIP
-                      << " (user: " << username << ")" << std::endl;
+        // v4.4.2 NYC socket-leak fix: short-TTL credential cache. Sustained
+        // same-credential traffic (Explorer + bridge relayer + miners all
+        // hitting 127.0.0.1:8332 with the same rpc:rpc creds) would otherwise
+        // run PBKDF2-HMAC-SHA3 100k iterations TWICE per request (~200 ms CPU
+        // on a 2-vCPU host), saturate the worker pool, and produce CLOSE-WAIT
+        // accumulation as clients FIN'd before responses landed. The cache
+        // bypass is keyed on SHA3-256(user || 0x00 || pass), TTL 60 s on
+        // success / 5 s on failure, bounded at 256 entries.
+        //
+        // IMPORTANT ordering: lockout/rate-limit checks already ran above
+        // (lines for IsLockedOut and AllowRequest), so a cache hit cannot
+        // bypass them. Cache hits also intentionally bypass the
+        // RecordAuthSuccess / RecordAuthFailure counters — the original
+        // outcome was already recorded when the entry was inserted on miss.
+        uint32_t cachedPermissions = 0;
+        RPCAuth::CachedAuthResult cacheRes =
+            RPCAuth::TryCachedAuth(username, password, cachedPermissions);
 
-            // Phase 1: Log security event
+        if (cacheRes == RPCAuth::CachedAuthResult::HitFail) {
+            // Cached known-bad creds. Same response as a live failure, and
+            // also increment the per-IP failure counter so the rate-limiter
+            // lockout reflects sustained-bad-credentials traffic — without
+            // this, a same-bad-cred flood would desync the lockout count
+            // from reality (red-team M-1).
+            m_rateLimiter.RecordAuthFailure(clientIP);
             if (m_logger) {
                 m_logger->LogSecurityEvent("AUTH_FAILURE", clientIP, username,
-                    "Invalid credentials provided");
+                    "Invalid credentials (cache hit)");
             }
-
-            // Invalid credentials - record failure
-            m_rateLimiter.RecordAuthFailure(clientIP);
             std::string response = BuildHTTPUnauthorized();
             send_response_and_cleanup(response);
             return;
         }
 
-        // RPC-016 FIX: Audit log successful authentication
-        std::cout << "[RPC-AUDIT] Successful authentication from " << clientIP
-                  << " (user: " << username << ")" << std::endl;
-        
-        // Phase 1: Log security event
-        if (m_logger) {
-            m_logger->LogSecurityEvent("AUTH_SUCCESS", clientIP, username, "Authentication successful");
-        }
+        if (cacheRes == RPCAuth::CachedAuthResult::HitSuccess) {
+            // Fast path: skip BOTH PBKDF2 calls. permissions resolved from cache.
+            userPermissions = cachedPermissions;
+        } else {
+            // Cache miss — full PBKDF2 path.
+            if (!RPCAuth::AuthenticateRequest(username, password)) {
+                // RPC-016 FIX: Audit log failed authentication attempt
+                std::cout << "[RPC-SECURITY] Failed authentication from " << clientIP
+                          << " (user: " << username << ")" << std::endl;
 
-        // Authentication successful - reset failure counter
-        m_rateLimiter.RecordAuthSuccess(clientIP);
+                // Phase 1: Log security event
+                if (m_logger) {
+                    m_logger->LogSecurityEvent("AUTH_FAILURE", clientIP, username,
+                        "Invalid credentials provided");
+                }
 
-        // FIX-014: Get user permissions for authorization checking
-        if (m_permissions) {
-            if (!m_permissions->AuthenticateUser(username, password, userPermissions)) {
+                // Invalid credentials - record failure + cache the failure to
+                // prevent flooding the PBKDF2 path with the same bad creds.
+                m_rateLimiter.RecordAuthFailure(clientIP);
+                RPCAuth::CacheAuthFail(username, password);
+                std::string response = BuildHTTPUnauthorized();
+                send_response_and_cleanup(response);
+                return;
+            }
+
+            // RPC-016 FIX: Audit log successful authentication
+            std::cout << "[RPC-AUDIT] Successful authentication from " << clientIP
+                      << " (user: " << username << ")" << std::endl;
+
+            // Phase 1: Log security event
+            if (m_logger) {
+                m_logger->LogSecurityEvent("AUTH_SUCCESS", clientIP, username, "Authentication successful");
+            }
+
+            // Authentication successful - reset failure counter
+            m_rateLimiter.RecordAuthSuccess(clientIP);
+
+            // FIX-014: Get user permissions for authorization checking
+            if (m_permissions) {
+                if (!m_permissions->AuthenticateUser(username, password, userPermissions)) {
                 // CVE-2026-RPC-AUTH (H-A5): RPCAuth said yes, permissions
                 // store says no. This is NOT an auth failure — both stores
                 // are supposed to agree (port_review row #17). Return 503
@@ -1270,32 +1310,40 @@ void CRPCServer::HandleClient(int clientSocket) {
                 return;
             }
 
-            std::cout << "[RPC-PERMISSIONS] User '" << username << "' has role: "
-                      << CRPCPermissions::GetRoleName(userPermissions) << std::endl;
-        } else {
-            // CVE-2026-RPC-AUTH (H-A5): m_permissions==nullptr means startup
-            // skipped permissions init — an init-invariant violation. Post-H1
-            // startup aborts if init fails, so this branch is dead under
-            // normal conditions. Return 503 (not 401) so an operator sees the
-            // real cause if the invariant is ever broken.
-            std::cerr << "[RPC-PERMISSIONS] CRITICAL: Permissions subsystem not initialized "
-                      << "but request reached permission check. Init invariant violated." << std::endl;
-            if (m_logger) {
-                m_logger->LogSecurityEvent("AUTH_INIT_INVARIANT", clientIP, username,
-                    "m_permissions==nullptr after successful auth — init order broken");
+                std::cout << "[RPC-PERMISSIONS] User '" << username << "' has role: "
+                          << CRPCPermissions::GetRoleName(userPermissions) << std::endl;
+
+                // Cache the resolved permissions for subsequent same-credential
+                // requests within the success TTL (60 s). Bypass-safe: lockout
+                // and rate-limit checks ran above this block, and divergence
+                // (H-A5) is NEVER cached (we don't reach this point on
+                // divergence; the 503 branch returns earlier).
+                RPCAuth::CacheAuthSuccess(username, password, userPermissions);
+            } else {
+                // CVE-2026-RPC-AUTH (H-A5): m_permissions==nullptr means startup
+                // skipped permissions init — an init-invariant violation. Post-H1
+                // startup aborts if init fails, so this branch is dead under
+                // normal conditions. Return 503 (not 401) so an operator sees the
+                // real cause if the invariant is ever broken.
+                std::cerr << "[RPC-PERMISSIONS] CRITICAL: Permissions subsystem not initialized "
+                          << "but request reached permission check. Init invariant violated." << std::endl;
+                if (m_logger) {
+                    m_logger->LogSecurityEvent("AUTH_INIT_INVARIANT", clientIP, username,
+                        "m_permissions==nullptr after successful auth — init order broken");
+                }
+                const std::string body = "{\"error\":\"Server misconfiguration: RPC permissions not initialized. See server log.\",\"code\":-32603}";
+                std::ostringstream oss;
+                oss << "HTTP/1.1 503 Service Unavailable\r\n"
+                    << "Content-Type: application/json\r\n"
+                    << "Content-Length: " << body.size() << "\r\n"
+                    << "Connection: close\r\n"
+                    << "\r\n"
+                    << body;
+                std::string response = oss.str();
+                send_response_and_cleanup(response);
+                return;
             }
-            const std::string body = "{\"error\":\"Server misconfiguration: RPC permissions not initialized. See server log.\",\"code\":-32603}";
-            std::ostringstream oss;
-            oss << "HTTP/1.1 503 Service Unavailable\r\n"
-                << "Content-Type: application/json\r\n"
-                << "Content-Length: " << body.size() << "\r\n"
-                << "Connection: close\r\n"
-                << "\r\n"
-                << body;
-            std::string response = oss.str();
-            send_response_and_cleanup(response);
-            return;
-        }
+        }  // end cache-miss (full PBKDF2) branch
     }
 
     // Parse HTTP request
