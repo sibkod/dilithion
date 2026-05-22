@@ -3,6 +3,8 @@
 
 #include <rpc/ratelimiter.h>
 
+#include <core/chainparams.h>  // for g_chainParams->seedAttestationIPs (red-team F-01)
+
 // Configuration constants
 const std::chrono::seconds CRateLimiter::WINDOW_DURATION(60);  // 1 minute
 const std::chrono::seconds CRateLimiter::AUTH_LOCKOUT_BASE(60);  // 1 minute base
@@ -93,16 +95,32 @@ const std::map<std::string, CRateLimiter::MethodRateLimit> CRateLimiter::METHOD_
     {"waitforblockheight",     {10.0, 0.167, 1.0}},
 };
 
-// Mainnet seed-mesh IPs exempt from per-IP rate limiting. Same trust model
-// as the 127.0.0.1 exemption — these hosts mutually trust each other for
-// status polling (Explorer-on-NYC fan-out to LDN/SGP/SYD; cross-seed health
-// checks). Listed inline rather than in chainparams to keep the exemption
-// surface tightly scoped and easy to audit. 2026-05-22.
+// Seed-mesh IPs exempt from the per-IP request token bucket. Same trust
+// model as the 127.0.0.1 exemption — these hosts mutually trust each other
+// for status polling (Explorer-on-NYC fan-out to LDN/SGP/SYD; cross-seed
+// health checks). The list comes from the chain params seed-attestation
+// IP list — Dilithion::g_chainParams->seedAttestationIPs — which is the
+// single storage-of-record for "who is a seed". When a seed rotates IP,
+// chainparams updates and this exemption follows automatically.
+//
+// IPv4-only string compare is acceptable today because the network-layer
+// ExtractAddress unwraps IPv4-mapped IPv6 ("::ffff:138.197.68.128" → the
+// IPv4 literal) before the IP reaches the rate limiter (see the IPv6
+// smoke tests). If seeds ever get AAAA records this helper needs to be
+// extended; chain params is the right place to add the parallel v6 list.
+//
+// Defense in depth: if g_chainParams is not yet initialized (call path
+// before InitChainParams), the helper returns false — meaning no IP is
+// exempted — so we never accidentally over-grant under a missing-init
+// invariant violation.
 static bool IsSeedMeshIP(const std::string& ip) {
-    return ip == "138.197.68.128"   // NYC
-        || ip == "167.172.56.119"   // LDN
-        || ip == "165.22.103.114"   // SGP
-        || ip == "134.199.159.83";  // SYD
+    if (ip.empty()) return false;
+    const auto* cp = Dilithion::g_chainParams;
+    if (!cp) return false;
+    for (const auto& seedIP : cp->seedAttestationIPs) {
+        if (seedIP == ip) return true;
+    }
+    return false;
 }
 
 bool CRateLimiter::AllowRequest(const std::string& ipAddress) {
@@ -157,9 +175,16 @@ bool CRateLimiter::AllowMethodRequest(const std::string& ipAddress, const std::s
     if (ipAddress == "127.0.0.1" || ipAddress == "::1") {
         return true;
     }
-    if (IsSeedMeshIP(ipAddress)) {
-        return true;
-    }
+    // NOTE: seed-mesh exemption is INTENTIONALLY NOT extended to per-method
+    // rate limits. Cross-seed polling only needs the low-tier methods
+    // (getblockchaininfo, getconnectioncount, getnetworkinfo) — well inside
+    // every per-method default. Exempting seed IPs at the per-method layer
+    // too would broaden the wallet-method attack surface (walletpassphrase,
+    // dumpprivkey, sendtoaddress, forcerebuild) in a recycled-IP scenario
+    // where a deprovisioned seed IP gets handed to a new cloud tenant. The
+    // per-IP bucket exemption in AllowRequest already covers the legitimate
+    // fan-out cost; per-method buckets stay enforced as a defense-in-depth
+    // layer (red-team F-03, 2026-05-22).
 
     std::lock_guard<std::mutex> lock(m_mutex);
 
