@@ -5,6 +5,15 @@
  * Queries all 4 mainnet seed nodes directly via RPC.
  * NYC is local (127.0.0.1), others via direct HTTP.
  * Cached for 3 seconds to avoid overloading nodes.
+ *
+ * 2026-05-22: replaced 3 parallel per-node curl handles (12 HTTP requests
+ * total) with one JSON-RPC batch per node (4 HTTP requests total). The
+ * seed's per-IP token-bucket rate limiter costs 1 token per HTTP request,
+ * so the old pattern drained 3 tokens per seed per Explorer poll, which
+ * intermittently rejected one of the 3 calls (often getnetworkinfo or
+ * getblockchaininfo) and produced ghost "offline" flashes in the UI.
+ * Batch RPC: 1 HTTP request → 1 token → 1 auth check → 3 methods executed
+ * server-side. Auth is also cache-warm on the cache-hit path (v4.4.2+leakfix).
  */
 
 require_once __DIR__ . "/rpc.php";
@@ -37,44 +46,47 @@ $seedNodes = [
     ['id' => 'syd', 'ip' => '134.199.159.83', 'host' => '134.199.159.83', 'label' => 'Sydney',    'flag' => 'AU', 'primary' => false],
 ];
 
-// Query all nodes in parallel using curl_multi
+// Method id mapping for batch responses (id field on each sub-request).
+$batchMethods = [
+    1 => 'getblockchaininfo',
+    2 => 'getconnectioncount',
+    3 => 'getnetworkinfo',
+];
+
+// Build one curl handle per node carrying a JSON-RPC batch of all 3 methods.
 $multiHandle = curl_multi_init();
 $curlHandles = [];
 
-// For each node, create 3 requests: getblockchaininfo, getconnectioncount, getnetworkinfo
-$requests = [];
 foreach ($seedNodes as $i => $node) {
-    $methods = ['getblockchaininfo', 'getconnectioncount', 'getnetworkinfo'];
-    foreach ($methods as $j => $method) {
-        $ch = curl_init();
-        $url = "http://{$node['host']}:{$rpcPort}/";
-        $payload = json_encode(['jsonrpc' => '2.0', 'id' => 1, 'method' => $method, 'params' => []]);
-        curl_setopt($ch, CURLOPT_URL, $url);
-        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-        curl_setopt($ch, CURLOPT_POST, true);
-        curl_setopt($ch, CURLOPT_POSTFIELDS, $payload);
-        curl_setopt($ch, CURLOPT_TIMEOUT, 3);
-        curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 2);
-        curl_setopt($ch, CURLOPT_HTTPHEADER, [
-            'Content-Type: application/json',
-            'X-Dilithion-RPC: 1',
-            'Authorization: Basic ' . base64_encode('rpc:rpc'),
-        ]);
-        curl_multi_add_handle($multiHandle, $ch);
-        $key = "{$i}_{$j}";
-        $curlHandles[$key] = $ch;
-        $requests[$key] = ['node' => $i, 'method' => $method];
+    $batch = [];
+    foreach ($batchMethods as $id => $method) {
+        $batch[] = ['jsonrpc' => '2.0', 'id' => $id, 'method' => $method, 'params' => []];
     }
+    $payload = json_encode($batch);
+
+    $ch = curl_init();
+    $url = "http://{$node['host']}:{$rpcPort}/";
+    curl_setopt($ch, CURLOPT_URL, $url);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_POST, true);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, $payload);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 10);
+    curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 5);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, [
+        'Content-Type: application/json',
+        'X-Dilithion-RPC: 1',
+        'Authorization: Basic ' . base64_encode('rpc:rpc'),
+    ]);
+    curl_multi_add_handle($multiHandle, $ch);
+    $curlHandles[$i] = $ch;
 }
 
-// Execute all requests in parallel
 $running = null;
 do {
     curl_multi_exec($multiHandle, $running);
     curl_multi_select($multiHandle, 0.1);
 } while ($running > 0);
 
-// Collect results
 $nodeData = [];
 foreach ($seedNodes as $i => $node) {
     $nodeData[$i] = [
@@ -92,30 +104,39 @@ foreach ($seedNodes as $i => $node) {
     ];
 }
 
-foreach ($curlHandles as $key => $ch) {
+foreach ($curlHandles as $i => $ch) {
     $response = curl_multi_getcontent($ch);
     $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
     curl_multi_remove_handle($multiHandle, $ch);
     curl_close($ch);
 
     if ($httpCode !== 200 || !$response) continue;
-    $data = json_decode($response, true);
-    if (!$data || isset($data['error']) && $data['error'] !== null) continue;
-    $result = $data['result'] ?? null;
-    if ($result === null) continue;
+    $parsed = json_decode($response, true);
+    if (!is_array($parsed)) continue;
 
-    $nodeIdx = $requests[$key]['node'];
-    $method = $requests[$key]['method'];
+    // JSON-RPC batch response is an array; single-response shape is also
+    // tolerated (defensive — should not happen here, but the server may
+    // return a single error object on a malformed batch).
+    $entries = (isset($parsed[0]) && is_array($parsed[0])) ? $parsed : [$parsed];
 
-    if ($method === 'getblockchaininfo') {
-        $nodeData[$nodeIdx]['online'] = true;
-        $nodeData[$nodeIdx]['height'] = $result['blocks'] ?? 0;
-        $nodeData[$nodeIdx]['chain'] = $result['chain'] ?? null;
-        $nodeData[$nodeIdx]['difficulty'] = $result['difficulty'] ?? null;
-    } elseif ($method === 'getconnectioncount') {
-        $nodeData[$nodeIdx]['peers'] = $result;
-    } elseif ($method === 'getnetworkinfo') {
-        $nodeData[$nodeIdx]['version'] = $result['subversion'] ?? null;
+    foreach ($entries as $entry) {
+        if (!is_array($entry)) continue;
+        if (isset($entry['error']) && $entry['error'] !== null) continue;
+        $id = $entry['id'] ?? null;
+        $result = $entry['result'] ?? null;
+        if ($result === null || !isset($batchMethods[$id])) continue;
+
+        $method = $batchMethods[$id];
+        if ($method === 'getblockchaininfo') {
+            $nodeData[$i]['online'] = true;
+            $nodeData[$i]['height'] = $result['blocks'] ?? 0;
+            $nodeData[$i]['chain'] = $result['chain'] ?? null;
+            $nodeData[$i]['difficulty'] = $result['difficulty'] ?? null;
+        } elseif ($method === 'getconnectioncount') {
+            $nodeData[$i]['peers'] = $result;
+        } elseif ($method === 'getnetworkinfo') {
+            $nodeData[$i]['version'] = $result['subversion'] ?? null;
+        }
     }
 }
 
