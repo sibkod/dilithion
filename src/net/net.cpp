@@ -1419,7 +1419,8 @@ bool CNetMessageProcessor::ProcessTxMessage(int peer_id, CDataStream& stream) {
                 bool is_severe = (error.find("double-spend") != std::string::npos ||
                                   error.find("invalid signature") != std::string::npos ||
                                   error.find("malformed") != std::string::npos);
-                int penalty = is_severe ? 50 : 10;  // Severe violations get higher penalty
+                //2 points for synchronizing lagging nodes
+                int penalty = is_severe ? 50 : 2;  // Severe violations get higher penalty
                 peer_manager.Misbehaving(peer_id, penalty, MisbehaviorType::INVALID_TRANSACTION);
                 return false;
             }
