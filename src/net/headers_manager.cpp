@@ -1326,7 +1326,6 @@ std::vector<CHeadersManager::HeaderTipInfo> CHeadersManager::GetCompetingHeaderT
 bool CHeadersManager::IsHeaderSyncInProgress() const
 {
     std::lock_guard<std::mutex> lock(cs_headers);
-    if (m_last_request_hash.IsNull()) return false;
 
     // Check if the last header request is stale (no response in HEADER_SYNC_STALE_SECS)
     auto now = std::chrono::steady_clock::now();
